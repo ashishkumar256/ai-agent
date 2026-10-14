@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Kubernetes API credentials; never commit this file
+/k8s/agent-secrets.yaml

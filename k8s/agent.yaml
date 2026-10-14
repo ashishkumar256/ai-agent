@@ -64,6 +64,16 @@ subjects:
     name: k8s-ai-agent
     namespace: k8s-ai-agent
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-credentials
+  namespace: k8s-ai-agent
+type: Opaque
+data:
+  GROQ_API_KEY: <YOUR_BASE64_ENCODED_GROQ_API_KEY>
+  GITHUB_TOKEN: <YOUR_BASE64_ENCODED_GITHUB_TOKEN>
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -95,7 +105,7 @@ spec:
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
-                name: groq-api
+                name: agent-credentials
           env:
             - name: GROQ_MODEL
               value: openai/gpt-oss-120b

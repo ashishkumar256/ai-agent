@@ -23,6 +23,9 @@ import secrets
 import shlex
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -50,6 +53,7 @@ MUTATING = {"apply_manifest", "generate_secret", "pod_exec", "k8s_delete"}
 ALWAYS_ASK = {"k8s_delete"}         # never offered the "always" shortcut
 approved_always = set()
 APPROVED_NS = []                    # namespaces the user approved this run (first = default)
+TASK_MANIFESTS = set()
 
 core = None                         # CoreV1Api
 dyn = None                          # DynamicClient (any kind / CRD)
@@ -160,6 +164,7 @@ def write_manifest(filename, content):
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
     path.write_text(content if content.endswith("\n") else content + "\n")
+    TASK_MANIFESTS.add(filename)
     what = ", ".join(f"{d['kind']}/{d['metadata']['name']}" for d in docs)
     return f"{'Updated' if existed else 'Wrote'} {path} containing: {what}"
 
@@ -413,6 +418,90 @@ def generate_secret(name, keys, namespace=""):
     return f"created secret {ns}/{name} with keys {keys} (values not shown)"
 
 
+def github_api(method, endpoint, token, payload=None):
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        f"https://api.github.com{endpoint}", data=body, method=method,
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}",
+                 "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read()) if response.status != 204 else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:500]
+        raise RuntimeError(f"GitHub API returned {e.code}: {detail}") from None
+
+
+def push_task_manifests(repo, branch, directory="manifests"):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("repository must be owner/name")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith("-"):
+        raise ValueError("invalid branch name")
+    directory = directory.strip("/")
+    if directory and not re.fullmatch(r"[A-Za-z0-9._/-]+", directory):
+        raise ValueError("destination directory contains unsupported characters")
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is not set; configure it in the agent-credentials Secret")
+    if not TASK_MANIFESTS:
+        raise RuntimeError("no manifest files were written during this task")
+
+    api_repo = "/repos/" + repo
+    ref = github_api("GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}", token)
+    parent_sha = ref["object"]["sha"]
+    parent = github_api("GET", f"{api_repo}/git/commits/{parent_sha}", token)
+    entries = []
+    for filename in sorted(TASK_MANIFESTS):
+        content = manifest_path(filename).read_text()
+        if any(doc.get("kind") == "Secret" for doc in yaml.safe_load_all(content) if doc):
+            raise ValueError(f"refusing to publish Secret resource in {filename}")
+        blob = github_api("POST", f"{api_repo}/git/blobs", token,
+                          {"content": content, "encoding": "utf-8"})
+        path = "/".join(part for part in (directory, filename) if part)
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+    tree = github_api("POST", f"{api_repo}/git/trees", token,
+                      {"base_tree": parent["tree"]["sha"], "tree": entries})
+    commit = github_api("POST", f"{api_repo}/git/commits", token,
+                        {"message": "Add Kubernetes manifests from k8s-ai-agent",
+                         "tree": tree["sha"], "parents": [parent_sha]})
+    github_api("PATCH", f"{api_repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}", token,
+               {"sha": commit["sha"], "force": False})
+    return f"Pushed {len(entries)} manifest(s) to {repo}@{branch} ({commit['sha'][:7]})"
+
+
+def finish_task(report, task):
+    if not report or not report.lstrip().startswith("TASK STATUS: PASS") or not TASK_MANIFESTS:
+        return
+    print("\nTask validated. Manifest files written: " + ", ".join(sorted(TASK_MANIFESTS)))
+    choice = input("Artifacts: [l] keep in pod, [g] push to GitHub, [d] discard: ").strip().lower()
+    if choice in ("", "l", "local"):
+        print(f"Kept in {MANIFEST_DIR} (pod-local storage; removed when the pod is replaced).")
+    elif choice in ("d", "discard"):
+        for filename in TASK_MANIFESTS:
+            manifest_path(filename).unlink(missing_ok=True)
+        print("Removed this task's generated manifest files.")
+    elif choice in ("g", "github"):
+        repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*[:=]\s*([^\s]+)", task)
+        url_match = re.search(r"https?://github\.com/([^/\s]+/[^/\s#]+)", task)
+        branch_match = re.search(r"(?im)^\s*branch\s*[:=]\s*([^\s]+)", task)
+        report_repo = re.search(r"(?im)^\s*repository\s*:\s*([^\s]+)", report)
+        report_branch = re.search(r"(?im)^\s*branch\s*:\s*([^\s]+)", report)
+        repo_default = (report_repo.group(1) if report_repo else
+                repo_match.group(1) if repo_match else
+                url_match.group(1).removesuffix(".git") if url_match else "")
+        branch_default = report_branch.group(1) if report_branch else branch_match.group(1) if branch_match else ""
+        repo = input(f"GitHub repository owner/name [{repo_default}]: ").strip() or repo_default
+        branch = input(f"Target branch [{branch_default}]: ").strip() or branch_default
+        directory = input("Repository directory [manifests]: ").strip() or "manifests"
+        try:
+            print(push_task_manifests(repo, branch, directory))
+        except Exception as e:
+            print(f"GitHub publish failed: {type(e).__name__}: {e}")
+    else:
+        print("Unrecognized choice; files remain in the pod-local manifest directory.")
+
+
 def k8s_delete(kind, api_version, name, namespace=""):
     res = dyn.resources.get(api_version=api_version, kind=kind)
     if not res.namespaced:
@@ -531,7 +620,10 @@ Workflow:
 4. Verify with evidence (namespace_overview, pod_exec with pods=[...]). Put independent tool calls in one turn.
 5. If requirements are unclear or a prerequisite is missing, ask the user in plain text.
 6. If the user denies an action, do not retry; explain what you need.
-7. Final report, short: files written, PASS/FAIL per check with evidence, caveats.
+7. Final report, short: begin with exactly `TASK STATUS: PASS` only when all requested changes and
+    validations succeeded; otherwise begin with `TASK STATUS: FAIL`. Include files written, checks with
+    evidence, and caveats. When GitHub publishing is requested, include `repository: owner/name` and
+    `branch: branch-name` in the report.
 Be concise between tool calls."""
 
 
@@ -679,10 +771,10 @@ def run_agent(messages):
             resp = llm_call(messages)
         except LimitReached as e:
             print(f"\nStopped: {e}")
-            return
+            return None
         except Exception as e:
             print(f"\nLLM error: {type(e).__name__}: {str(e)[:400]}")
-            return
+            return None
 
         msg = resp.choices[0].message
         entry = {"role": "assistant", "content": msg.content or ""}
@@ -696,7 +788,7 @@ def run_agent(messages):
             print(f"\nAgent: {msg.content}")
         if not msg.tool_calls:
             print(f"\n(session total: {STATS['calls']} calls, {STATS['tokens']} tokens)")
-            return
+            return msg.content or ""
 
         for tc in msg.tool_calls:
             try:
@@ -709,6 +801,7 @@ def run_agent(messages):
             print(f"  [tool] {tc.function.name}({shown}) -> {out[:160].replace(chr(10), ' ')}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
     print("Stopped: step limit reached.")
+    return None
 
 
 def read_task():
@@ -773,7 +866,9 @@ def main():
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": task}]
-    run_agent(messages)
+    TASK_MANIFESTS.clear()
+    report = run_agent(messages)
+    finish_task(report, task)
 
     while True:                                              # follow-up chat, same memory
         follow = input("\nYou (or 'exit'): ").strip()
@@ -786,7 +881,9 @@ def main():
             print(f"Switched to model {MODEL}. Type 'continue' to resume.")
             continue
         messages.append({"role": "user", "content": follow})
-        run_agent(messages)
+        TASK_MANIFESTS.clear()
+        report = run_agent(messages)
+        finish_task(report, follow)
 
 
 if __name__ == "__main__":

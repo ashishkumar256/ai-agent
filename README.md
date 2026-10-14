@@ -74,15 +74,13 @@ Edit `k8s/agent.yaml` before applying it:
 - Replace the example image with the pushed image.
 - Change the `GROQ_MODEL` value if needed.
 
-Create the API key Secret interactively (or provision it with your platform's secret manager), then deploy
-and attach to the pod's interactive terminal:
+Edit `k8s/agent-secrets.yaml` with your Groq API key and GitHub token. The file is git-ignored; do not
+commit it. The GitHub token needs Contents: Read and write access to the target repository. Apply the
+Secret, then deploy and attach to the pod's interactive terminal:
 
 ```bash
 kubectl create namespace k8s-ai-agent
-read -s 'GROQ_API_KEY?Groq API key: '
-echo
-kubectl -n k8s-ai-agent create secret generic groq-api --from-literal="GROQ_API_KEY=$GROQ_API_KEY"
-unset GROQ_API_KEY
+kubectl apply -f k8s/agent-secrets.yaml
 kubectl apply -f k8s/agent.yaml
 kubectl -n k8s-ai-agent rollout status deployment/k8s-ai-agent
 kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app=k8s-ai-agent -o name | head -n 1)
@@ -92,6 +90,11 @@ Enter the task at the prompt. The pod uses its ServiceAccount token through the 
 configuration; it does not need a mounted kubeconfig. It remains interactive because approvals and the
 task are entered in the terminal. Detaching does not stop the process; reconnect with the attach command.
 The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
+After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
+discard them, or push them to GitHub. Include `repository: owner/name` and `branch: branch-name` in the task
+when requesting a push. Publishing creates one commit containing only manifests written during that task,
+under `manifests/` in the target repository; Kubernetes Secret resources are refused. The GitHub token is
+used only for the publish request and is never included in the commit.
 
 The included custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. The agent still asks before using each namespace.
@@ -194,6 +197,7 @@ Constants at the top of `k8s_agent.py`:
 | `k8s_agent.py` | The agent |
 | `~/manifest/` | Manifests the agent writes (`00-namespace.yaml`, `10-...`, `30-...`); safe to review, edit, and reuse |
 | `~/.kube/config` | Cluster access (read only) |
+| `k8s/agent-secrets.yaml` | Local-only Kubernetes Secret manifest containing Groq and GitHub credentials; git-ignored |
 
 ## Troubleshooting
 
