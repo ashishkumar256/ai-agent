@@ -243,6 +243,9 @@ def k8s_get(kind, api_version, namespace="", name="", label_selector="", path=""
     ns = ns_for(res, namespace)
     if name:
         obj = res.get(name=name, namespace=ns).to_dict()
+        if kind == "Secret":
+            obj.pop("data", None)
+            obj.pop("stringData", None)
         meta = obj.get("metadata", {})
         meta.pop("managedFields", None)
         if "annotations" in meta:
@@ -743,19 +746,23 @@ def main():
 
     key = os.environ.get("GROQ_API_KEY") or getpass.getpass("Groq API key: ").strip()
     llm = Groq(api_key=key)
-    MODEL = pick_model()
+    MODEL = os.environ.get("GROQ_MODEL") or pick_model()
 
     try:
-        contexts, active = config.list_kube_config_contexts()   # reads ~/.kube/config
-    except config.ConfigException as e:
-        sys.exit(f"Cannot read kubeconfig: {e}")
-    names = [c["name"] for c in contexts]
-    current = active["name"] if active else names[0]
-    print(f"Kube contexts: {', '.join(names)}  (current: {current})")
-    chosen = input("Context to use [Enter = current]: ").strip() or current
-    if chosen not in names:
-        sys.exit(f"Unknown context '{chosen}'")
-    config.load_kube_config(context=chosen)
+        config.load_incluster_config()
+        chosen = "in-cluster"
+    except config.ConfigException:
+        try:
+            contexts, active = config.list_kube_config_contexts()   # reads ~/.kube/config
+        except config.ConfigException as e:
+            sys.exit(f"Cannot read kubeconfig: {e}")
+        names = [c["name"] for c in contexts]
+        current = active["name"] if active else names[0]
+        print(f"Kube contexts: {', '.join(names)}  (current: {current})")
+        chosen = input("Context to use [Enter = current]: ").strip() or current
+        if chosen not in names:
+            sys.exit(f"Unknown context '{chosen}'")
+        config.load_kube_config(context=chosen)
     core = client.CoreV1Api()
     dyn = dynamic.DynamicClient(client.ApiClient())
     print(f"Using model {MODEL} | cluster context {chosen} | manifests dir {MANIFEST_DIR}")

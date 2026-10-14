@@ -60,6 +60,45 @@ You are asked, in order:
 After the first report you can keep giving instructions in the same session. Type `exit` to quit.
 `/model <name>` switches model without losing the session; follow it with `continue`.
 
+## Run in Kubernetes
+
+Build and publish the image to a registry your cluster can pull from:
+
+```bash
+docker build -t ghcr.io/YOUR_ORG/k8s-ai-agent:latest .
+docker push ghcr.io/YOUR_ORG/k8s-ai-agent:latest
+```
+
+Edit `k8s/agent.yaml` before applying it:
+
+- Replace the example image with the pushed image.
+- Change the `GROQ_MODEL` value if needed.
+
+Create the API key Secret interactively (or provision it with your platform's secret manager), then deploy
+and attach to the pod's interactive terminal:
+
+```bash
+kubectl create namespace k8s-ai-agent
+read -s 'GROQ_API_KEY?Groq API key: '
+echo
+kubectl -n k8s-ai-agent create secret generic groq-api --from-literal="GROQ_API_KEY=$GROQ_API_KEY"
+unset GROQ_API_KEY
+kubectl apply -f k8s/agent.yaml
+kubectl -n k8s-ai-agent rollout status deployment/k8s-ai-agent
+kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app=k8s-ai-agent -o name | head -n 1)
+```
+
+Enter the task at the prompt. The pod uses its ServiceAccount token through the Kubernetes in-cluster
+configuration; it does not need a mounted kubeconfig. It remains interactive because approvals and the
+task are entered in the terminal. Detaching does not stop the process; reconnect with the attach command.
+The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
+
+The included RBAC grants read access for API discovery across the cluster and full namespaced operations
+only in `k8s-ai-agent`. This means tasks that manage another namespace need corresponding Role/RoleBinding
+permissions and an approved namespace; do not bind the agent to `cluster-admin` for convenience. The agent
+can execute commands in pods in its permitted namespace, so treat the Groq key and workload like privileged
+automation. Kubernetes RBAC cannot restrict access by resource name or enforce the Python approval prompts.
+
 ## Example task: highly available PostgreSQL 16
 
 Paste this at the `Task>` prompt, then `/end`:
