@@ -452,6 +452,19 @@ def push_task_manifests(repo, branch, directory="manifests"):
     if not TASK_MANIFESTS:
         raise RuntimeError("no manifest files were written during this task")
 
+    publishable = []
+    skipped_secrets = []
+    for filename in sorted(TASK_MANIFESTS):
+        content = manifest_path(filename).read_text()
+        if any(doc.get("kind") == "Secret" for doc in yaml.safe_load_all(content) if doc):
+            skipped_secrets.append(filename)
+        else:
+            publishable.append((filename, content))
+    if skipped_secrets:
+        print("Skipped Secret-containing manifest(s): " + ", ".join(skipped_secrets))
+    if not publishable:
+        raise ValueError("no publishable manifests remain after excluding Secret resources")
+
     api_repo = "/repos/" + repo
     branch_ref = f"refs/heads/{branch}"
     ref_endpoint = f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
@@ -477,10 +490,7 @@ def push_task_manifests(repo, branch, directory="manifests"):
     parent_sha = ref["object"]["sha"]
     parent = github_api("GET", f"{api_repo}/git/commits/{parent_sha}", token)
     entries = []
-    for filename in sorted(TASK_MANIFESTS):
-        content = manifest_path(filename).read_text()
-        if any(doc.get("kind") == "Secret" for doc in yaml.safe_load_all(content) if doc):
-            raise ValueError(f"refusing to publish Secret resource in {filename}")
+    for filename, content in publishable:
         blob = github_api("POST", f"{api_repo}/git/blobs", token,
                           {"content": content, "encoding": "utf-8"})
         path = "/".join(part for part in (directory, filename) if part)
@@ -532,7 +542,6 @@ def finish_task(report, task):
                 print(f"GitHub publish failed: {type(e).__name__}: {e}")
                 if input("Retry GitHub push? [y/N]: ").strip().lower() != "y":
                     break
-                repo_default, branch_default, directory_default = repo, branch, directory
     else:
         print("Unrecognized choice; files remain in the pod-local manifest directory.")
 

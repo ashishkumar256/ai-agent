@@ -96,8 +96,9 @@ discard them, or push them to GitHub. Include `repository: owner/name` and `bran
 when requesting a push. Publishing creates one commit containing only manifests written during that task,
 under `manifests/` in the target repository; use `.` at the publish prompt to put them at the repository
 root. If the requested branch does not exist, the agent creates it from the repository's default branch.
-Kubernetes Secret resources are refused. The GitHub token is used only for the publish request and is
-never included in the commit.
+Files containing Kubernetes Secret resources are skipped before any GitHub API changes; if no safe files
+remain, publishing stops. Keep credentials and Secret manifests out of GitHub. The GitHub token is used
+only for the publish request and is never included in the commit.
 
 The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
