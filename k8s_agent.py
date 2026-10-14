@@ -15,6 +15,7 @@ Setup:
     pip install groq "kubernetes>=29" pyyaml
     (optional) export GROQ_API_KEY="your-key"
 """
+import base64
 import getpass
 import json
 import os
@@ -424,6 +425,28 @@ class GitHubAPIError(RuntimeError):
         self.status = status
 
 
+def redact_secret_manifest(filename, content):
+    docs = [doc for doc in yaml.safe_load_all(content) if doc]
+    has_secret = False
+    for doc in docs:
+        if doc.get("kind") != "Secret":
+            continue
+        has_secret = True
+        metadata = doc.setdefault("metadata", {})
+        name = metadata.get("name", "secret")
+        metadata["name"] = f"{name.removesuffix('-example')}-example"
+        annotations = metadata.setdefault("annotations", {})
+        annotations["k8s-ai-agent.example/redacted"] = "true"
+        for field in ("data", "stringData"):
+            values = doc.get(field) or {}
+            for key in values:
+                values[key] = (base64.b64encode(b"REPLACE_BEFORE_USE").decode()
+                               if field == "data" else "REPLACE_BEFORE_USE")
+    if not has_secret:
+        return filename, content, False
+    return filename + ".example", yaml.safe_dump_all(docs, sort_keys=False), True
+
+
 def github_api(method, endpoint, token, payload=None):
     body = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
@@ -453,17 +476,14 @@ def push_task_manifests(repo, branch, directory="manifests"):
         raise RuntimeError("no manifest files were written during this task")
 
     publishable = []
-    skipped_secrets = []
     for filename in sorted(TASK_MANIFESTS):
         content = manifest_path(filename).read_text()
-        if any(doc.get("kind") == "Secret" for doc in yaml.safe_load_all(content) if doc):
-            skipped_secrets.append(filename)
-        else:
-            publishable.append((filename, content))
-    if skipped_secrets:
-        print("Skipped Secret-containing manifest(s): " + ", ".join(skipped_secrets))
+        remote_filename, content, has_secret = redact_secret_manifest(filename, content)
+        if has_secret:
+            print(f"Redacted Secret values from {filename}; publishing as {remote_filename}")
+        publishable.append((remote_filename, content))
     if not publishable:
-        raise ValueError("no publishable manifests remain after excluding Secret resources")
+        raise ValueError("no manifests are available to publish")
 
     api_repo = "/repos/" + repo
     branch_ref = f"refs/heads/{branch}"
