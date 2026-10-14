@@ -44,31 +44,34 @@ docker build -t ghcr.io/YOUR_ORG/k8s-ai-agent:latest .
 docker push ghcr.io/YOUR_ORG/k8s-ai-agent:latest
 ```
 
-The chart creates the credentials Secret. Enter both credentials without echoing them, then install the
-chart; Helm creates the namespace and chart resources:
+The chart creates a credentials Secret when either credential is supplied. The Groq key is required by the
+agent; the GitHub token is optional and is only needed to publish manifests. Enter the keys as plain text,
+without base64 encoding, and without echoing them. The chart applies Helm's `b64enc` to populate Kubernetes
+Secret `data`; then install the chart, which creates the namespace and chart resources:
 
 ```bash
 read -r -s -p "Groq API key: " GROQ_API_KEY
 echo
-read -r -s -p "GitHub token: " GITHUB_TOKEN
+read -r -s -p "GitHub token (optional; press Enter to skip): " GITHUB_TOKEN
 echo
 helm upgrade --install k8s-ai-agent ./charts/k8s-ai-agent \
   --namespace k8s-ai-agent \
   --create-namespace \
   --set image.repository=ghcr.io/YOUR_ORG/k8s-ai-agent \
   --set image.tag=latest \
-  --set credentials.create=true \
   --set-string credentials.groqApiKey="$GROQ_API_KEY" \
-  --set-string credentials.githubToken="$GITHUB_TOKEN" \
-  --set groq.model=openai/gpt-oss-120b
+  --set-string credentials.githubToken="$GITHUB_TOKEN"
 unset GROQ_API_KEY GITHUB_TOKEN
 
 kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app.kubernetes.io/instance=k8s-ai-agent -o name | head -n 1)
 ```
 
-The chart creates the Namespace (through `--create-namespace`), credentials Secret, Deployment,
-ServiceAccount, ClusterRole, and ClusterRoleBinding. Helm stores supplied credential values in release
-metadata, so restrict access to the Helm release and use a cluster secret manager for production.
+The chart creates the Namespace (through `--create-namespace`), Deployment, ServiceAccount, ClusterRole,
+and ClusterRoleBinding. When either credential is non-empty, it creates a Secret with only the supplied
+key or keys and references it from the Deployment. If both are empty, the Deployment references the
+existing Secret named by `existingCredentialsSecret` (default `agent-credentials`). Helm stores supplied
+credential values in release metadata, so restrict access to the Helm release and use a cluster secret
+manager for production.
 
 Common chart settings can be overridden with `--set` or a values file:
 
@@ -78,8 +81,9 @@ Common chart settings can be overridden with `--set` or a values file:
 | `image.tag` | `latest` | Container image tag |
 | `groq.model` | `openai/gpt-oss-120b` | Groq chat model |
 | `replicaCount` | `1` | Number of agent pods |
-| `credentials.create` | `false` | Create a Secret from the supplied credential values |
-| `credentials.existingSecret` | `agent-credentials` | Secret name used by the Deployment when using an existing Secret |
+| `credentials.groqApiKey` | `""` | Groq key; a non-empty value causes chart-managed Secret creation |
+| `credentials.githubToken` | `""` | Optional GitHub token; a non-empty value causes chart-managed Secret creation |
+| `existingCredentialsSecret` | `agent-credentials` | Secret referenced only when both credential values are empty |
 | `rbac.create` | `true` | Create the chart's ClusterRole and ClusterRoleBinding |
 | `serviceAccount.create` | `true` | Create the ServiceAccount used by the agent |
 

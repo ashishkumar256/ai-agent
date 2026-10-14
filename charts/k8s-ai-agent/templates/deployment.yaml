@@ -23,9 +23,12 @@ spec:
         - name: agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $credentialsSecret := include "k8s-ai-agent.credentialsSecretName" . }}
+          {{- if $credentialsSecret }}
           envFrom:
             - secretRef:
-                name: {{ include "k8s-ai-agent.credentialsSecretName" . }}
+                name: {{ $credentialsSecret }}
+          {{- end }}
           env:
             - name: GROQ_MODEL
               value: {{ .Values.groq.model | quote }}

@@ -35,9 +35,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{- define "k8s-ai-agent.credentialsSecretName" -}}
-{{- if .Values.credentials.create -}}
+{{- if (values .Values.credentials | compact) -}}
 {{- printf "%s-credentials" (include "k8s-ai-agent.fullname" .) -}}
 {{- else -}}
-{{- .Values.credentials.existingSecret -}}
+{{- .Values.existingCredentialsSecret | default "" -}}
 {{- end -}}
 {{- end -}}

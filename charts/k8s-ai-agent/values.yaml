@@ -17,10 +17,10 @@ rbac:
   create: true
 
 credentials:
-  create: false
-  existingSecret: agent-credentials
   groqApiKey: ""
   githubToken: ""
+
+existingCredentialsSecret: agent-credentials
 
 groq:
   model: openai/gpt-oss-120b
