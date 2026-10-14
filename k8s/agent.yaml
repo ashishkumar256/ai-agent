@@ -117,6 +117,10 @@ spec:
           volumeMounts:
             - name: manifests
               mountPath: /home/agent/manifest
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: manifests
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
