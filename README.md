@@ -4,9 +4,9 @@ A small, generic Kubernetes operations agent. You describe a task in plain Engli
 [Groq](https://groq.com)) plans the work, writes manifests to disk, applies them to your cluster, waits,
 diagnoses failures, fixes them, and validates the result.
 
-- One file: `k8s_agent.py`
-- No command-line arguments: everything is asked through prompts
-- Talks to the cluster through the official `kubernetes` Python client (no `kubectl`, no `subprocess`)
+- The [Dockerfile](Dockerfile) builds the agent runtime image
+- The [Helm chart](charts/k8s-ai-agent/) deploys and configures the Kubernetes resources
+- Talks to the cluster through the official `kubernetes` Python client
 - Every change needs your approval
 - Also in this README: a [free LLM API tiers reference sheet](#free-llm-api-tiers-reference-sheet) (as of 14 October 2026)
 
@@ -28,63 +28,60 @@ end up with the final working YAML on disk.
 
 ## Requirements
 
-- Python 3.9+
-- A working kubeconfig (`~/.kube/config`, or the path in `$KUBECONFIG`)
+- Docker, Helm 3, and `kubectl`
 - A Groq API key (https://console.groq.com/keys) with access to a tool-calling model
   (for example `openai/gpt-oss-120b`)
+- A GitHub token with Contents read/write access if tasks should publish manifests to GitHub
 - Cluster permissions for whatever your task needs (RBAC applies as usual)
 
-## Install
+## Build and deploy with Docker and Helm
 
-```bash
-python -m venv venv
-source venv/bin/activate            # Windows: venv\Scripts\activate
-pip install groq "kubernetes>=29" pyyaml
-export GROQ_API_KEY="your-key"      # optional: the script asks if it is not set
-```
-
-## Run
-
-```bash
-python k8s_agent.py
-```
-
-You are asked, in order:
-
-1. **Groq API key**, only if `GROQ_API_KEY` is not set (input is hidden)
-2. **Model**: the script lists the models your key can use and proposes a default; press Enter to accept
-3. **Kube context**: press Enter for the current one
-4. **Task**: type or paste it (include the namespace), then put `/end` on its own line
-5. **Approvals** as the agent works (see [Safety model](#safety-model))
-
-After the first report you can keep giving instructions in the same session. Type `exit` to quit.
-`/model <name>` switches model without losing the session; follow it with `continue`.
-
-## Run in Kubernetes
-
-Build and publish the image to a registry your cluster can pull from:
+The [Dockerfile](Dockerfile) installs the Python dependencies and packages `k8s_agent.py` into the runtime
+image. Build and publish the image to a registry your cluster can pull from:
 
 ```bash
 docker build -t ghcr.io/YOUR_ORG/k8s-ai-agent:latest .
 docker push ghcr.io/YOUR_ORG/k8s-ai-agent:latest
 ```
 
-Edit `k8s/agent.yaml` before applying it:
-
-- Replace the example image with the pushed image.
-- Change the `GROQ_MODEL` value if needed.
-
-Edit `k8s/agent-secrets.yaml` with your Groq API key and GitHub token. The file is git-ignored; do not
-commit it. The GitHub token needs Contents: Read and write access to the target repository. Apply the
-Secret, then deploy and attach to the pod's interactive terminal:
+The chart creates the credentials Secret. Enter both credentials without echoing them, then install the
+chart; Helm creates the namespace and chart resources:
 
 ```bash
-kubectl create namespace k8s-ai-agent
-kubectl apply -f k8s/agent-secrets.yaml
-kubectl apply -f k8s/agent.yaml
-kubectl -n k8s-ai-agent rollout status deployment/k8s-ai-agent
-kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app=k8s-ai-agent -o name | head -n 1)
+read -r -s -p "Groq API key: " GROQ_API_KEY
+echo
+read -r -s -p "GitHub token: " GITHUB_TOKEN
+echo
+helm upgrade --install k8s-ai-agent ./charts/k8s-ai-agent \
+  --namespace k8s-ai-agent \
+  --create-namespace \
+  --set image.repository=ghcr.io/YOUR_ORG/k8s-ai-agent \
+  --set image.tag=latest \
+  --set credentials.create=true \
+  --set-string credentials.groqApiKey="$GROQ_API_KEY" \
+  --set-string credentials.githubToken="$GITHUB_TOKEN" \
+  --set groq.model=openai/gpt-oss-120b
+unset GROQ_API_KEY GITHUB_TOKEN
+
+kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app.kubernetes.io/instance=k8s-ai-agent -o name | head -n 1)
 ```
+
+The chart creates the Namespace (through `--create-namespace`), credentials Secret, Deployment,
+ServiceAccount, ClusterRole, and ClusterRoleBinding. Helm stores supplied credential values in release
+metadata, so restrict access to the Helm release and use a cluster secret manager for production.
+
+Common chart settings can be overridden with `--set` or a values file:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `image.repository` | `k8s-ai-agent` | Container image repository |
+| `image.tag` | `latest` | Container image tag |
+| `groq.model` | `openai/gpt-oss-120b` | Groq chat model |
+| `replicaCount` | `1` | Number of agent pods |
+| `credentials.create` | `false` | Create a Secret from the supplied credential values |
+| `credentials.existingSecret` | `agent-credentials` | Secret name used by the Deployment when using an existing Secret |
+| `rbac.create` | `true` | Create the chart's ClusterRole and ClusterRoleBinding |
+| `serviceAccount.create` | `true` | Create the ServiceAccount used by the agent |
 
 Enter the task at the prompt. The pod uses its ServiceAccount token through the Kubernetes in-cluster
 configuration; it does not need a mounted kubeconfig. It remains interactive because approvals and the
@@ -96,11 +93,13 @@ when requesting a push. Publishing creates one commit containing only manifests 
 under `manifests/` in the target repository; Kubernetes Secret resources are refused. The GitHub token is
 used only for the publish request and is never included in the commit.
 
-The included custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
-plus read-only discovery for namespaces and StorageClasses. The agent still asks before using each namespace.
-It cannot manage arbitrary resource kinds or CRDs unless their permissions are added to that allowlist.
-The agent can execute commands in pods and create Secrets in approved namespaces, so treat the Groq key and
-workload like privileged automation. Kubernetes RBAC cannot enforce the Python approval prompts.
+The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
+plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
+workload CRUD, pod logs and exec, and Secret creation. The agent still asks before using each namespace.
+It cannot manage arbitrary resource kinds or CRDs unless their permissions are added to the chart's RBAC
+template. The agent can execute commands in pods and create Secrets, so treat its credentials and workload
+like privileged automation. Kubernetes RBAC cannot enforce the Python approval prompts. Installing the
+chart requires permission to create ClusterRoles and ClusterRoleBindings.
 
 ## Example task: highly available PostgreSQL 16
 
@@ -149,7 +148,9 @@ want (for example, three independent databases instead of real replication).
 - **Every change asks first**: apply, secret creation, exec, delete. The prompt shows what will happen.
 - **Deletes always ask**, even if you answered `a` for other tools.
 - **Cluster-scoped objects are blocked**, except `Namespace`. Deleting cluster-scoped objects is not possible.
-- **No shell on your machine and no kubectl.** The only host action is writing YAML files into `~/manifest`.
+- **The running agent has no host shell or kubectl.** The operator uses `kubectl` to install the Helm
+  chart, create the credentials Secret, and attach to the pod; the agent itself talks to Kubernetes via
+  the Python client and only writes task manifests into its `~/manifest` directory.
 - **Secrets stay out of the model.** Passwords are generated locally and referenced with `secretKeyRef`;
   manifests contain no secret values.
 - **Step limit** (`MAX_STEPS`, default 60) and a retry limit on failures.
@@ -194,10 +195,13 @@ Constants at the top of `k8s_agent.py`:
 
 | Path | Purpose |
 |---|---|
-| `k8s_agent.py` | The agent |
-| `~/manifest/` | Manifests the agent writes (`00-namespace.yaml`, `10-...`, `30-...`); safe to review, edit, and reuse |
-| `~/.kube/config` | Cluster access (read only) |
-| `k8s/agent-secrets.yaml` | Local-only Kubernetes Secret manifest containing Groq and GitHub credentials; git-ignored |
+| `k8s_agent.py` | Agent application source |
+| `charts/k8s-ai-agent/Chart.yaml` | Helm chart metadata |
+| `charts/k8s-ai-agent/values.yaml` | Configurable image, credentials, RBAC, and pod defaults |
+| `charts/k8s-ai-agent/templates/secrets.yaml` | Optional chart-managed credentials Secret |
+| `charts/k8s-ai-agent/templates/rbac.yaml` | ServiceAccount, ClusterRole, and ClusterRoleBinding |
+| `charts/k8s-ai-agent/templates/deployment.yaml` | Agent Deployment, security context, resources, and writable volumes |
+| `~/manifest/` | Task manifests written by the running agent; pod-local in Kubernetes deployments |
 
 ## Troubleshooting
 
@@ -208,9 +212,8 @@ Constants at the top of `k8s_agent.py`:
 | `Groq daily limit reached` | Wait for the reset, use another key, or move to a paid tier |
 | `A single request exceeds your tokens-per-minute limit` | Use a model with a higher limit or shorten the task |
 | Repeated malformed tool calls | Switch model with `/model` |
-| `Cannot read kubeconfig` | Check `~/.kube/config` or set `KUBECONFIG` |
 | `403 Forbidden` | Your kube user lacks RBAC for that action |
-| `server_side_apply` attribute error | `pip install -U "kubernetes>=29"` |
+| `server_side_apply` attribute error | Rebuild and push the image, then run `helm upgrade --install` with the same chart settings |
 | PVC stays `Pending` | No default StorageClass or its provisioner is not working; ask the agent to check |
 | `ImagePullBackOff` | The agent reports it early with the event message. Wrong tag: it fixes it. Nodes cannot reach the registry: fix networking, no manifest change helps |
 | Pod still broken after the agent fixed a StatefulSet | A StatefulSet does not replace a not-ready pod after a spec change; the agent deletes the stuck pod (you approve) so it is recreated |

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: k8s-ai-agent
+description: Kubernetes operations agent powered by Groq
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
