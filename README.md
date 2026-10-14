@@ -93,11 +93,11 @@ configuration; it does not need a mounted kubeconfig. It remains interactive bec
 task are entered in the terminal. Detaching does not stop the process; reconnect with the attach command.
 The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
 
-The included RBAC grants read access for API discovery across the cluster and full namespaced operations
-only in `k8s-ai-agent`. This means tasks that manage another namespace need corresponding Role/RoleBinding
-permissions and an approved namespace; do not bind the agent to `cluster-admin` for convenience. The agent
-can execute commands in pods in its permitted namespace, so treat the Groq key and workload like privileged
-automation. Kubernetes RBAC cannot restrict access by resource name or enforce the Python approval prompts.
+The included custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
+plus read-only discovery for namespaces and StorageClasses. The agent still asks before using each namespace.
+It cannot manage arbitrary resource kinds or CRDs unless their permissions are added to that allowlist.
+The agent can execute commands in pods and create Secrets in approved namespaces, so treat the Groq key and
+workload like privileged automation. Kubernetes RBAC cannot enforce the Python approval prompts.
 
 ## Example task: highly available PostgreSQL 16
 

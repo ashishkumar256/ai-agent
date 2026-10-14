@@ -402,15 +402,14 @@ def generate_secret(name, keys, namespace=""):
     """Create a Secret with random values (values are never shown to the model)."""
     ns = pick_ns(namespace)
     keys = [str(k) for k in as_list(keys, ",")]
-    try:
-        core.read_namespaced_secret(name, ns)
-        return f"secret {ns}/{name} already exists, left unchanged"
-    except ApiException as e:
-        if e.status != 404:
-            raise
     body = client.V1Secret(metadata=client.V1ObjectMeta(name=name),
                            string_data={k: secrets.token_urlsafe(24) for k in keys})
-    core.create_namespaced_secret(ns, body)
+    try:
+        core.create_namespaced_secret(ns, body)
+    except ApiException as e:
+        if e.status == 409:
+            return f"secret {ns}/{name} already exists, left unchanged"
+        raise
     return f"created secret {ns}/{name} with keys {keys} (values not shown)"
 
 
