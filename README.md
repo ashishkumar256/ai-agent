@@ -94,8 +94,10 @@ The generated manifests live in the pod's temporary `emptyDir` and are lost if t
 After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
 discard them, or push them to GitHub. Include `repository: owner/name` and `branch: branch-name` in the task
 when requesting a push. Publishing creates one commit containing only manifests written during that task,
-under `manifests/` in the target repository; Kubernetes Secret resources are refused. The GitHub token is
-used only for the publish request and is never included in the commit.
+under `manifests/` in the target repository; use `.` at the publish prompt to put them at the repository
+root. If the requested branch does not exist, the agent creates it from the repository's default branch.
+Kubernetes Secret resources are refused. The GitHub token is used only for the publish request and is
+never included in the commit.
 
 The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common

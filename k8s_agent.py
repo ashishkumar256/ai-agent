@@ -418,6 +418,12 @@ def generate_secret(name, keys, namespace=""):
     return f"created secret {ns}/{name} with keys {keys} (values not shown)"
 
 
+class GitHubAPIError(RuntimeError):
+    def __init__(self, status, detail):
+        super().__init__(f"GitHub API returned {status}: {detail}")
+        self.status = status
+
+
 def github_api(method, endpoint, token, payload=None):
     body = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
@@ -429,7 +435,7 @@ def github_api(method, endpoint, token, payload=None):
             return json.loads(response.read()) if response.status != 204 else {}
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"GitHub API returned {e.code}: {detail}") from None
+        raise GitHubAPIError(e.code, detail) from None
 
 
 def push_task_manifests(repo, branch, directory="manifests"):
@@ -437,7 +443,7 @@ def push_task_manifests(repo, branch, directory="manifests"):
         raise ValueError("repository must be owner/name")
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith("-"):
         raise ValueError("invalid branch name")
-    directory = directory.strip("/")
+    directory = "" if directory.strip() in ("", ".") else directory.strip("/")
     if directory and not re.fullmatch(r"[A-Za-z0-9._/-]+", directory):
         raise ValueError("destination directory contains unsupported characters")
     token = os.environ.get("GITHUB_TOKEN")
@@ -447,7 +453,27 @@ def push_task_manifests(repo, branch, directory="manifests"):
         raise RuntimeError("no manifest files were written during this task")
 
     api_repo = "/repos/" + repo
-    ref = github_api("GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}", token)
+    branch_ref = f"refs/heads/{branch}"
+    ref_endpoint = f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
+    try:
+        ref = github_api("GET", ref_endpoint, token)
+    except GitHubAPIError as e:
+        if e.status != 404:
+            raise
+        repository = github_api("GET", api_repo, token)
+        default_branch = repository.get("default_branch")
+        if not default_branch:
+            raise RuntimeError(f"repository {repo} has no default branch to base '{branch}' on") from e
+        source_ref = github_api(
+            "GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(default_branch, safe='/')}", token)
+        try:
+            ref = github_api("POST", f"{api_repo}/git/refs", token,
+                             {"ref": branch_ref, "sha": source_ref["object"]["sha"]})
+            print(f"Created branch {branch} from {default_branch}")
+        except GitHubAPIError as create_error:
+            if create_error.status != 422:
+                raise
+            ref = github_api("GET", ref_endpoint, token)
     parent_sha = ref["object"]["sha"]
     parent = github_api("GET", f"{api_repo}/git/commits/{parent_sha}", token)
     entries = []
@@ -485,19 +511,28 @@ def finish_task(report, task):
         repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*[:=]\s*([^\s]+)", task)
         url_match = re.search(r"https?://github\.com/([^/\s]+/[^/\s#]+)", task)
         branch_match = re.search(r"(?im)^\s*branch\s*[:=]\s*([^\s]+)", task)
+        natural_branch = re.search(r"(?i)\b([A-Za-z0-9][A-Za-z0-9._/-]*)\s+branch\b", task)
         report_repo = re.search(r"(?im)^\s*repository\s*:\s*([^\s]+)", report)
         report_branch = re.search(r"(?im)^\s*branch\s*:\s*([^\s]+)", report)
         repo_default = (report_repo.group(1) if report_repo else
                 repo_match.group(1) if repo_match else
                 url_match.group(1).removesuffix(".git") if url_match else "")
-        branch_default = report_branch.group(1) if report_branch else branch_match.group(1) if branch_match else ""
-        repo = input(f"GitHub repository owner/name [{repo_default}]: ").strip() or repo_default
-        branch = input(f"Target branch [{branch_default}]: ").strip() or branch_default
-        directory = input("Repository directory [manifests]: ").strip() or "manifests"
-        try:
-            print(push_task_manifests(repo, branch, directory))
-        except Exception as e:
-            print(f"GitHub publish failed: {type(e).__name__}: {e}")
+        branch_default = (report_branch.group(1) if report_branch else
+                          branch_match.group(1) if branch_match else
+                          natural_branch.group(1) if natural_branch else "")
+        directory_default = "manifests"
+        while True:
+            repo = input(f"GitHub repository owner/name [{repo_default}]: ").strip() or repo_default
+            branch = input(f"Target branch [{branch_default}]: ").strip() or branch_default
+            directory = input(f"Repository directory [{directory_default}]: ").strip() or directory_default
+            try:
+                print(push_task_manifests(repo, branch, directory))
+                break
+            except Exception as e:
+                print(f"GitHub publish failed: {type(e).__name__}: {e}")
+                if input("Retry GitHub push? [y/N]: ").strip().lower() != "y":
+                    break
+                repo_default, branch_default, directory_default = repo, branch, directory
     else:
         print("Unrecognized choice; files remain in the pod-local manifest directory.")
 
