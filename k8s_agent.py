@@ -54,6 +54,7 @@ ALWAYS_ASK = {"k8s_delete"}         # never offered the "always" shortcut
 approved_always = set()
 APPROVED_NS = []                    # namespaces the user approved this run (first = default)
 TASK_MANIFESTS = set()
+PUBLISH_TARGET = {}
 
 core = None                         # CoreV1Api
 dyn = None                          # DynamicClient (any kind / CRD)
@@ -650,7 +651,7 @@ def push_gitlab_manifests(api_root, project, branch, directory, publishable, tok
     return branch, commit["id"]
 
 
-def push_task_manifests(repo, branch, directory="manifests"):
+def push_task_manifests(repo, branch, directory="manifests", provider_hint=""):
     provider, origin, project, url_branch = parse_repository_target(repo)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", project):
         raise ValueError("repository project path contains unsupported characters")
@@ -663,7 +664,15 @@ def push_task_manifests(repo, branch, directory="manifests"):
     if not TASK_MANIFESTS:
         raise RuntimeError("no manifest files were written, read, or applied during this task")
 
-    provider = detect_git_provider(provider, origin or "")
+    if provider_hint:
+        provider_hint = provider_hint.strip().lower()
+        if provider_hint not in ("github", "gitlab"):
+            raise ValueError("provider_hint must be github or gitlab")
+        if provider and provider != provider_hint:
+            raise ValueError(f"repository URL identifies {provider}, but LLM target says {provider_hint}")
+        provider = provider_hint
+    else:
+        provider = detect_git_provider(provider, origin or "")
     if provider == "github":
         token = os.environ.get("GITHUB_TOKEN", "")
         if not token:
@@ -690,6 +699,19 @@ def push_task_manifests(repo, branch, directory="manifests"):
     return f"Pushed {len(publishable)} manifest(s) to {remote}@{branch} ({commit_sha[:7]})"
 
 
+def set_publish_target(git_provider, repository, branch=""):
+    provider = str(git_provider).strip().lower()
+    repository = str(repository).strip()
+    branch = str(branch).strip()
+    if provider not in ("github", "gitlab"):
+        raise ValueError("git_provider must be github or gitlab")
+    if not repository:
+        raise ValueError("repository is required when the task requests publishing")
+    PUBLISH_TARGET.clear()
+    PUBLISH_TARGET.update({"provider": provider, "repository": repository, "branch": branch})
+    return f"publish target recorded: provider={provider}, repository={repository}, branch={branch or '(default)'}"
+
+
 def finish_task(report, task):
     if not report or not report.lstrip().startswith("TASK STATUS: PASS"):
         return "Publishing not performed because the task did not pass validation."
@@ -704,29 +726,22 @@ def finish_task(report, task):
             manifest_path(filename).unlink(missing_ok=True)
         return "Task manifests discarded; repository publishing was not performed."
     elif choice in ("g", "github", "git"):
-        repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*[:=]\s*([^\s]+)", task)
-        url_match = re.search(r"https?://[^\s]+", task)
-        branch_match = re.search(r"(?im)^\s*branch\s*[:=]\s*([^\s]+)", task)
-        natural_branch = re.search(r"(?i)\b([A-Za-z0-9][A-Za-z0-9._/-]*)\s+branch\b", task)
-        report_repo = re.search(r"(?im)^\s*repository\s*:\s*([^\s]+)", report)
-        report_branch = re.search(r"(?im)^\s*branch\s*:\s*([^\s]+)", report)
-        repo_default = (report_repo.group(1) if report_repo else
-                        repo_match.group(1) if repo_match else
-                        url_match.group(0).rstrip(".,);]") if url_match else "")
+        target = dict(PUBLISH_TARGET)
+        repo_default = target.get("repository", "")
+        branch_default = target.get("branch", "")
+        provider_default = target.get("provider", "")
         try:
             _, _, _, url_branch = parse_repository_target(repo_default)
         except ValueError:
             url_branch = ""
-        branch_default = (report_branch.group(1) if report_branch else
-                          branch_match.group(1) if branch_match else
-                          natural_branch.group(1) if natural_branch else url_branch)
+        branch_default = branch_default or url_branch
         directory_default = "manifests"
         while True:
             repo = input(f"Repository URL or owner/project [{repo_default}]: ").strip() or repo_default
             branch = input(f"Target branch [default: {branch_default or 'repository default'}]: ").strip() or branch_default
             directory = input(f"Repository directory [{directory_default}]: ").strip() or directory_default
             try:
-                return push_task_manifests(repo, branch, directory)
+                return push_task_manifests(repo, branch, directory, provider_hint=provider_default)
             except Exception as e:
                 print(f"Git publish failed: {type(e).__name__}: {e}")
                 if input("Retry publish? [y/N]: ").strip().lower() != "y":
@@ -756,7 +771,7 @@ def k8s_delete(kind, api_version, name, namespace=""):
 
 TOOLS = {f.__name__: f for f in (
     namespace_overview, k8s_get, k8s_events, pod_logs, write_manifest, read_manifest,
-    apply_manifest, wait_until_ready, pod_exec, k8s_delete)}
+    apply_manifest, wait_until_ready, pod_exec, set_publish_target, k8s_delete)}
 
 
 # --------------------------------------------------------------------------
@@ -844,6 +859,10 @@ TOOL_SPECS = [
          ["kind", "api_version", "name"]),
     tool("pod_exec", "Run a command (argv list, no shell) in one pod or in several (pods list). Returns exit code and output.",
          {"command": LIST, "pod": S, "pods": LIST, "namespace": NSP, "container": S}, ["command"]),
+        tool("set_publish_target", "For a task requesting Git publishing, interpret its intent and record the Git provider, "
+                 "repository URL or namespace/project, and target branch. Call this once before the final report.",
+                 {"git_provider": {"type": "string", "enum": ["github", "gitlab"]},
+                    "repository": S, "branch": S}, ["git_provider", "repository"]),
     tool("k8s_delete", "Delete one namespaced object (needs user approval).",
          {"kind": KIND, "api_version": APIV, "name": S, "namespace": NSP}, ["kind", "api_version", "name"]),
 ]
@@ -876,6 +895,9 @@ Workflow:
     with evidence, and caveats. Never claim files were pushed, published, or committed. Repository publishing
     happens only after this report, when the user chooses it at the artifact prompt; actual results are reported
     by the publisher.
+8. If the task requests committing/pushing/publishing artifacts to Git, use set_publish_target to interpret
+   the provider (GitHub or GitLab), repository, and branch from the user's request. Do not expect Python to
+   infer these details from natural-language task text.
 Be concise between tool calls."""
 
 
@@ -1124,6 +1146,7 @@ def main():
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": task}]
     TASK_MANIFESTS.clear()
+    PUBLISH_TARGET.clear()
     report = run_agent(messages)
     artifact_result = finish_task(report, task)
     if report:
@@ -1141,6 +1164,7 @@ def main():
             continue
         messages.append({"role": "user", "content": follow})
         TASK_MANIFESTS.clear()
+        PUBLISH_TARGET.clear()
         report = run_agent(messages)
         artifact_result = finish_task(report, follow)
         if report:

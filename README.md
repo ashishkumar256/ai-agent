@@ -99,8 +99,9 @@ The artifact list includes manifests written, read, or applied during the curren
 from earlier tasks are not included automatically. After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
 discard them, or push them to GitHub/GitLab. Include `repository: URL` and `branch: branch-name` in the task
 when requesting a push. Give the full GitHub/GitLab repository URL in the task; custom GitHub Enterprise and
-self-managed GitLab URLs are supported. The publish prompt accepts a full URL or `owner/project`, and defaults
-to the task's URL and branch when present. Publishing creates one commit containing only manifests included in
+self-managed GitLab URLs are supported. The LLM interprets the task and records the provider, repository, and
+branch for the publish prompt; Python validates that target and performs the API operations. Publishing creates
+one commit containing only manifests included in
 that task, under `manifests/` in the target repository; use `.` at the publish prompt to put them at the
 repository root. If the requested branch does not exist, the agent creates it from the repository's default
 branch. Non-Secret manifests are committed exactly as saved. Secret `stringData` values are replaced in the
