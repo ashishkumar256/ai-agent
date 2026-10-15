@@ -103,9 +103,10 @@ self-managed GitLab URLs are supported. The publish prompt accepts a full URL or
 to the task's URL and branch when present. Publishing creates one commit containing only manifests included in
 that task, under `manifests/` in the target repository; use `.` at the publish prompt to put them at the
 repository root. If the requested branch does not exist, the agent creates it from the repository's default
-branch. Files, including Secret manifests, are committed exactly as saved: Secret values are not redacted.
-Use this only when you intend those credentials to be stored in the repository; the GitHub or GitLab token is
-used only for publishing and is never included in the commit.
+branch. Non-Secret manifests are committed exactly as saved. Secret `stringData` values are replaced in the
+Git publish copy with the same number of `*` characters; Secret `data` values are replaced by base64-encoded
+stars matching the decoded secret length. The pod-local Secret manifest remains unchanged. The GitHub or GitLab
+token is used only for publishing and is never included in the commit.
 
 The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
@@ -165,9 +166,11 @@ want (for example, three independent databases instead of real replication).
 - **The running agent has no host shell or kubectl.** The operator uses `kubectl` to install the Helm
   chart, create the credentials Secret, and attach to the pod; the agent itself talks to Kubernetes via
   the Python client and only writes task manifests into its `~/manifest` directory.
-- **Secret values are exposed in this mode.** Secret YAML is saved locally, its values are included in model
-  tool history, and publishing commits them unchanged. Use this only for demo credentials you intend to store
-  in the repository; protect local manifests and never publish production credentials.
+- **Secret values are exposed in this mode.** Secret YAML is saved locally and its values are included in model
+  tool history. Git publishing masks the repository copy, but local manifests and model history still contain
+  the real value; protect them and never use production credentials for this demo workflow.
+- Console output masks Secret `data` and `stringData` values with same-length stars; this is display-only and does not
+  change the manifest file or model context. On Git publishing, the repository copy is also masked.
 - Credential sourcing follows the task: users can request literal environment values, per-key
   `env.valueFrom.secretKeyRef`, `envFrom.secretRef`, or another source. When a required credential has no
   specified source or Secret injection style, the agent asks instead of choosing one.

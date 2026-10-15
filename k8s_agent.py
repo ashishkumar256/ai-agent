@@ -15,6 +15,7 @@ Setup:
     pip install groq "kubernetes>=29" pyyaml
     (optional) export GROQ_API_KEY="your-key"
 """
+import base64
 import getpass
 import json
 import os
@@ -67,6 +68,76 @@ def cut(text, n=None):
     n = n or MAX_TOOL_OUTPUT
     text = str(text)
     return text if len(text) <= n else text[:n] + f"\n...[truncated {len(text) - n} chars]"
+
+
+def secret_values():
+    values = set()
+    for filename in TASK_MANIFESTS:
+        path = manifest_path(filename)
+        if not path.is_file():
+            continue
+        try:
+            docs = [doc for doc in yaml.safe_load_all(path.read_text()) if isinstance(doc, dict)]
+        except (OSError, yaml.YAMLError):
+            continue
+        for doc in docs:
+            if doc.get("kind") != "Secret":
+                continue
+            for field in ("stringData", "data"):
+                for raw_value in (doc.get(field) or {}).values():
+                    value = str(raw_value)
+                    if value:
+                        values.add(value)
+                    if field == "data" and value:
+                        try:
+                            decoded = base64.b64decode(value).decode()
+                            if decoded:
+                                values.add(decoded)
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+    return sorted(values, key=len, reverse=True)
+
+
+def mask_secret_values(text):
+    text = str(text)
+    for value in secret_values():
+        text = text.replace(value, "*" * len(value))
+    return text
+
+
+def mask_manifest_for_display(content):
+    try:
+        docs = [doc for doc in yaml.safe_load_all(content) if doc]
+    except yaml.YAMLError:
+        return mask_secret_values(content)
+    changed = False
+    for doc in docs:
+        if not isinstance(doc, dict) or doc.get("kind") != "Secret":
+            continue
+        for field in ("stringData", "data"):
+            values = doc.get(field) or {}
+            for key in values:
+                values[key] = "*" * len(str(values[key]))
+                changed = True
+    return mask_secret_values(yaml.safe_dump_all(docs, sort_keys=False) if changed else content)
+
+
+def mask_secret_manifest_for_publish(content):
+    docs = [doc for doc in yaml.safe_load_all(content) if doc]
+    for doc in docs:
+        if not isinstance(doc, dict) or doc.get("kind") != "Secret":
+            continue
+        data_values = doc.get("data") or {}
+        for key, encoded in data_values.items():
+            try:
+                decoded = base64.b64decode(str(encoded), validate=True)
+                data_values[key] = base64.b64encode(b"*" * len(decoded)).decode("ascii")
+            except (ValueError, TypeError):
+                data_values[key] = "*" * len(str(encoded))
+        for values in (doc.get("stringData") or {},):
+            for key, value in values.items():
+                values[key] = "*" * len(str(value))
+    return yaml.safe_dump_all(docs, sort_keys=False)
 
 
 def as_bool(v):
@@ -604,8 +675,11 @@ def push_task_manifests(repo, branch, directory="manifests"):
             raise RuntimeError("GITLAB_TOKEN is not set in the agent credentials Secret")
         api_root = f"{origin}/api/v4"
 
-    publishable = [(filename, manifest_path(filename).read_text())
-                   for filename in sorted(TASK_MANIFESTS)]
+    publishable = []
+    for filename in sorted(TASK_MANIFESTS):
+        content = manifest_path(filename).read_text()
+        published_content = mask_secret_manifest_for_publish(content)
+        publishable.append((filename, published_content))
     if provider == "github":
         branch, commit_sha = push_github_manifests(api_root, project, branch, directory,
                                                    publishable, token)
@@ -665,9 +739,10 @@ def format_final_report(report, artifact_result):
     lines = report.splitlines()
     status = next((line.strip() for line in lines
                    if line.strip().startswith("TASK STATUS:")), "TASK STATUS: FAIL")
-    details = [line for line in lines if line.strip() != status
+    details = [mask_secret_values(line) for line in lines if line.strip() != status
                and not re.search(r"\b(committed|commit|pushed|push|published|publish)\b", line, re.IGNORECASE)]
-    return "\n".join([status, *details, f"Repository publishing: {artifact_result}"])
+    return "\n".join([status, *details,
+                      f"Repository publishing: {mask_secret_values(artifact_result)}"])
 
 
 def k8s_delete(kind, api_version, name, namespace=""):
@@ -759,7 +834,8 @@ TOOL_SPECS = [
          {"pod": S, "container": S, "namespace": NSP, "previous": {"type": "boolean"}, "tail": INT}, ["pod"]),
     tool("write_manifest", "Save YAML (may hold several --- documents) to ~/manifest/<filename>, e.g. 20-statefulset.yaml. "
             "Follow the user's requested configuration. For Secret integration, support env.valueFrom.secretKeyRef "
-            "or envFrom.secretRef as requested; publishing commits manifest contents exactly as saved.",
+            "or envFrom.secretRef as requested; Secret files stay unchanged locally, while Git publishing masks "
+            "Secret values with same-length stars.",
          {"filename": S, "content": S}, ["filename", "content"]),
     tool("read_manifest", "Read a saved manifest file.", {"filename": S}, ["filename"]),
     tool("apply_manifest", "Server-side apply a saved manifest file to the cluster.", {"filename": S}, ["filename"]),
@@ -785,8 +861,8 @@ Workflow:
     whether to use literal environment values, env.valueFrom.secretKeyRef, envFrom.secretRef, or another source.
     For every StatefulSet, create and apply the Service named by spec.serviceName before applying the StatefulSet.
     Include the Service manifest in task artifacts. Apply Secret manifests before workloads that reference them.
-    Secret values in manifests are present in local files and model tool history; publishing commits exact
-    manifest contents.
+    Secret values in manifests are present in local files and model tool history; Git publishing replaces
+    Secret values with same-length stars in the repository copy only.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).
@@ -961,7 +1037,7 @@ def run_agent(messages):
                                    for tc in msg.tool_calls]
         messages.append(entry)
         if msg.content and msg.tool_calls:
-            print(f"\nAgent: {msg.content}")
+            print(f"\nAgent: {mask_secret_values(msg.content)}")
         if not msg.tool_calls:
             print(f"\n(session total: {STATS['calls']} calls, {STATS['tokens']} tokens)")
             return msg.content or ""
@@ -973,8 +1049,13 @@ def run_agent(messages):
                 out = run_tool(tc.function.name, args)
             except json.JSONDecodeError:
                 args, out = {}, "Error: arguments were not valid JSON"
-            shown = {k: (v if len(str(v)) < 70 else str(v)[:67] + "...") for k, v in args.items()}
-            print(f"  [tool] {tc.function.name}({shown}) -> {out[:160].replace(chr(10), ' ')}")
+            display_args = dict(args)
+            if isinstance(display_args.get("content"), str):
+                display_args["content"] = mask_manifest_for_display(display_args["content"])
+            shown = {k: (v if len(str(v)) < 70 else str(v)[:67] + "...")
+                     for k, v in display_args.items()}
+            displayed_out = mask_secret_values(out)
+            print(f"  [tool] {tc.function.name}({shown}) -> {displayed_out[:160].replace(chr(10), ' ')}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
     print("Stopped: step limit reached.")
     return None
