@@ -20,7 +20,6 @@ import getpass
 import json
 import os
 import re
-import secrets
 import shlex
 import sys
 import time
@@ -50,7 +49,7 @@ MAX_STEPS = 60
 MANIFEST_DIR = Path.home() / "manifest"
 FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml")
 
-MUTATING = {"apply_manifest", "generate_secret", "pod_exec", "k8s_delete"}
+MUTATING = {"apply_manifest", "pod_exec", "k8s_delete"}
 ALWAYS_ASK = {"k8s_delete"}         # never offered the "always" shortcut
 approved_always = set()
 APPROVED_NS = []                    # namespaces the user approved this run (first = default)
@@ -404,21 +403,6 @@ def pod_exec(command, pod="", pods=None, namespace="", container="", timeout_sec
     return cut("\n".join(_exec_one(ns, t, command, container, int(timeout_seconds)) for t in targets))
 
 
-def generate_secret(name, keys, namespace=""):
-    """Create a Secret with random values (values are never shown to the model)."""
-    ns = pick_ns(namespace)
-    keys = [str(k) for k in as_list(keys, ",")]
-    body = client.V1Secret(metadata=client.V1ObjectMeta(name=name),
-                           string_data={k: secrets.token_urlsafe(24) for k in keys})
-    try:
-        core.create_namespaced_secret(ns, body)
-    except ApiException as e:
-        if e.status == 409:
-            return f"secret {ns}/{name} already exists, left unchanged"
-        raise
-    return f"created secret {ns}/{name} with keys {keys} (values not shown)"
-
-
 class GitHubAPIError(RuntimeError):
     def __init__(self, status, detail):
         super().__init__(f"GitHub API returned {status}: {detail}")
@@ -577,7 +561,7 @@ def k8s_delete(kind, api_version, name, namespace=""):
 
 TOOLS = {f.__name__: f for f in (
     namespace_overview, k8s_get, k8s_events, pod_logs, write_manifest, read_manifest,
-    apply_manifest, wait_until_ready, pod_exec, generate_secret, k8s_delete)}
+    apply_manifest, wait_until_ready, pod_exec, k8s_delete)}
 
 
 # --------------------------------------------------------------------------
@@ -654,7 +638,8 @@ TOOL_SPECS = [
     tool("pod_logs", "Pod container logs (previous=true after a crash).",
          {"pod": S, "container": S, "namespace": NSP, "previous": {"type": "boolean"}, "tail": INT}, ["pod"]),
     tool("write_manifest", "Save YAML (may hold several --- documents) to ~/manifest/<filename>, e.g. 20-statefulset.yaml. "
-         "No secret values.", {"filename": S, "content": S}, ["filename", "content"]),
+         "Secret values are stored in the local manifest; GitHub publishing redacts them.",
+         {"filename": S, "content": S}, ["filename", "content"]),
     tool("read_manifest", "Read a saved manifest file.", {"filename": S}, ["filename"]),
     tool("apply_manifest", "Server-side apply a saved manifest file to the cluster.", {"filename": S}, ["filename"]),
     tool("wait_until_ready", "Wait for a StatefulSet/Deployment/Pod/Job to be ready; returns PROBLEM early if pods are stuck.",
@@ -662,8 +647,6 @@ TOOL_SPECS = [
          ["kind", "api_version", "name"]),
     tool("pod_exec", "Run a command (argv list, no shell) in one pod or in several (pods list). Returns exit code and output.",
          {"command": LIST, "pod": S, "pods": LIST, "namespace": NSP, "container": S}, ["command"]),
-    tool("generate_secret", "Create a Secret with random values for the keys, if missing. Use via secretKeyRef.",
-         {"name": S, "keys": LIST, "namespace": NSP}, ["name", "keys"]),
     tool("k8s_delete", "Delete one namespaced object (needs user approval).",
          {"kind": KIND, "api_version": APIV, "name": S, "namespace": NSP}, ["kind", "api_version", "name"]),
 ]
@@ -675,7 +658,8 @@ Workflow:
 2. If the namespace does not exist, create it. write_manifest (one file per component, numbered:
    00-namespace.yaml, 10-..., 30-...), then apply_manifest. Do not ask the user for permission to do what the
    task asks: the user approves every change at a prompt anyway.
-   Passwords: generate_secret + secretKeyRef; never put secret values in manifests.
+    Secrets: write Secret YAML with stringData like any other resource, then apply it with apply_manifest. Secret
+    values are present in local manifests and model tool history; GitHub publishing replaces them with placeholders.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).

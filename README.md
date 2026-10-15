@@ -117,8 +117,8 @@ Paste this at the `Task>` prompt, then `/end`:
 Provision and validate a highly available 3-replica PostgreSQL 16 StatefulSet in namespace `middleware`
 with 20Gi storage per replica, using the default StorageClass (do not set storageClassName).
 Use the official postgres:16 image. HA means real streaming replication: postgres-0 is the primary,
-postgres-1 and postgres-2 are standbys built with pg_basebackup. Passwords come from a Secret created
-with the generate_secret tool. Add a headless Service and a postgres-primary Service.
+postgres-1 and postgres-2 are standbys built with pg_basebackup. Include a Secret manifest with the
+password in stringData and reference it with secretKeyRef. Add a headless Service and a postgres-primary Service.
 Validate: 3/3 pods Ready, PVCs Bound at 20Gi on the default class, server version 16,
 postgres-0 not in recovery with 2 streaming replicas, standbys in recovery, replication lag near zero.
 ```
@@ -138,12 +138,11 @@ want (for example, three independent databases instead of real replication).
 | `k8s_get` | Get or list any kind (including CRDs); `path` returns only part of an object | no |
 | `k8s_events` | Recent events for a namespace or object | no |
 | `pod_logs` | Container logs, including previous crashed container | no |
-| `write_manifest` | Save YAML to `~/manifest/<file>` | no |
+| `write_manifest` | Save YAML to `~/manifest/<file>`; Secret values are stored locally and redacted on GitHub publish | no |
 | `read_manifest` | Read a saved manifest | no |
 | `apply_manifest` | Server-side apply of a saved manifest file | **yes** (`a` = always this run) |
 | `wait_until_ready` | Wait for StatefulSet/Deployment/Pod/Job; returns early with evidence if pods are stuck | no |
 | `pod_exec` | Run a command (argv list, no shell) in one or several pods | **yes** (`a` = always this run) |
-| `generate_secret` | Create a Secret with random values; values are never shown to the model | **yes** (`a` = always this run) |
 | `k8s_delete` | Delete one namespaced object | **yes, every time** |
 
 `wait_until_ready` polls inside Python (no LLM calls) and recognizes `ImagePullBackOff`, `ErrImagePull`,
@@ -153,14 +152,15 @@ want (for example, three independent databases instead of real replication).
 
 - **Namespaces are approved on first use.** The first time the agent touches a namespace you get
   `Allow the agent to use namespace 'x'? [y/N]`. Applying a `Namespace` manifest that you approved counts too.
-- **Every change asks first**: apply, secret creation, exec, delete. The prompt shows what will happen.
+- **Every change asks first**: apply, exec, delete. Secret creation uses the normal `apply_manifest` approval.
 - **Deletes always ask**, even if you answered `a` for other tools.
 - **Cluster-scoped objects are blocked**, except `Namespace`. Deleting cluster-scoped objects is not possible.
 - **The running agent has no host shell or kubectl.** The operator uses `kubectl` to install the Helm
   chart, create the credentials Secret, and attach to the pod; the agent itself talks to Kubernetes via
   the Python client and only writes task manifests into its `~/manifest` directory.
-- **Secrets stay out of the model.** Passwords are generated locally and referenced with `secretKeyRef`;
-  manifests contain no secret values.
+- **Secret values are exposed in this mode.** Secret YAML is saved locally and its values are included in model
+  tool history. GitHub publishing replaces values with `REPLACE_BEFORE_USE` in an `*.yaml.example` file, but
+  protect local manifests and avoid pushing raw Secret YAML outside the agent's publish workflow.
 - **Step limit** (`MAX_STEPS`, default 60) and a retry limit on failures.
 - Stray keystrokes (for example from pasting) are discarded before each approval prompt.
 
