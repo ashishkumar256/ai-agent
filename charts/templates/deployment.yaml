@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "k8s-ai-agent.fullname" . }}
+  labels:
+    {{- include "k8s-ai-agent.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "k8s-ai-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-ai-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "k8s-ai-agent.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $credentialsSecret := include "k8s-ai-agent.credentialsSecretName" . }}
+          {{- if $credentialsSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ $credentialsSecret }}
+          {{- end }}
+          env:
+            - name: GROQ_MODEL
+              value: {{ .Values.groq.model | quote }}
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          stdin: {{ .Values.stdin }}
+          tty: {{ .Values.tty }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: manifests
+              mountPath: /home/agent/manifest
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: manifests
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

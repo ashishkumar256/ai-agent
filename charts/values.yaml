@@ -1,0 +1,54 @@
+replicaCount: 1
+
+image:
+  repository: k8s-ai-agent
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+
+rbac:
+  create: true
+
+credentials:
+  groqApiKey: ""
+  githubToken: ""
+  gitlabToken: ""
+
+existingCredentialsSecret: agent-credentials
+
+groq:
+  model: openai/gpt-oss-120b
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+terminationGracePeriodSeconds: 15
+stdin: true
+tty: true
