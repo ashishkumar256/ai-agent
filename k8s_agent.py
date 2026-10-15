@@ -170,7 +170,9 @@ def write_manifest(filename, content):
 
 
 def read_manifest(filename):
-    return cut(manifest_path(filename).read_text(), 6000)
+    content = manifest_path(filename).read_text()
+    TASK_MANIFESTS.add(filename)
+    return cut(content, 6000)
 
 
 # --------------------------------------------------------------------------
@@ -179,6 +181,7 @@ def read_manifest(filename):
 def apply_manifest(filename):
     """Server-side apply every document in ~/manifest/<filename>."""
     docs = load_docs(manifest_path(filename))
+    TASK_MANIFESTS.add(filename)
     file_ns = {d["metadata"]["name"] for d in docs if d["kind"] == "Namespace"}
     plan = []                                    # validate everything first, apply after
     for d in docs:
@@ -196,6 +199,27 @@ def apply_manifest(filename):
                                       f"(only Namespace objects)")
             ns = None
         plan.append((res, d, ns))
+
+    planned_services = {(ns, d["metadata"]["name"])
+                        for _, d, ns in plan if d["kind"] == "Service"}
+    service_res = dyn.resources.get(api_version="v1", kind="Service")
+    for _, d, ns in plan:
+        if d["kind"] != "StatefulSet":
+            continue
+        service_name = (d.get("spec") or {}).get("serviceName")
+        if not service_name or (ns, service_name) in planned_services:
+            continue
+        try:
+            service_res.get(name=service_name, namespace=ns)
+        except ApiException as e:
+            if e.status == 404:
+                raise ValueError(
+                    f"StatefulSet/{d['metadata']['name']} requires Service/{service_name} "
+                    f"in namespace {ns}; write and apply its Service manifest first") from e
+            raise
+
+    plan.sort(key=lambda item: 0 if item[1]["kind"] == "Namespace"
+              else 1 if item[1]["kind"] == "Service" else 2)
 
     done = []
     for res, d, ns in plan:
@@ -457,7 +481,7 @@ def push_task_manifests(repo, branch, directory="manifests"):
     if not token:
         raise RuntimeError("GITHUB_TOKEN is not set; configure it in the agent-credentials Secret")
     if not TASK_MANIFESTS:
-        raise RuntimeError("no manifest files were written during this task")
+        raise RuntimeError("no manifest files were written, read, or applied during this task")
 
     publishable = []
     for filename in sorted(TASK_MANIFESTS):
@@ -513,7 +537,7 @@ def push_task_manifests(repo, branch, directory="manifests"):
 def finish_task(report, task):
     if not report or not report.lstrip().startswith("TASK STATUS: PASS") or not TASK_MANIFESTS:
         return
-    print("\nTask validated. Manifest files written: " + ", ".join(sorted(TASK_MANIFESTS)))
+    print("\nTask validated. Manifest files included: " + ", ".join(sorted(TASK_MANIFESTS)))
     choice = input("Artifacts: [l] keep in pod, [g] push to GitHub, [d] discard: ").strip().lower()
     if choice in ("", "l", "local"):
         print(f"Kept in {MANIFEST_DIR} (pod-local storage; removed when the pod is replaced).")
@@ -663,8 +687,10 @@ Workflow:
     requests Secret-backed environment variables, support either env.valueFrom.secretKeyRef or envFrom.secretRef
     exactly as requested. If credentials are required but the user has not specified how to supply them, ask
     whether to use literal environment values, env.valueFrom.secretKeyRef, envFrom.secretRef, or another source.
-    Apply Secret manifests before workloads that reference them. Secret values in manifests are present in local
-    files and model tool history; GitHub publishing replaces them with placeholders.
+    For every StatefulSet, create and apply the Service named by spec.serviceName before applying the StatefulSet.
+    Include the Service manifest in task artifacts. Apply Secret manifests before workloads that reference them.
+    Secret values in manifests are present in local files and model tool history; GitHub publishing replaces
+    them with placeholders.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).

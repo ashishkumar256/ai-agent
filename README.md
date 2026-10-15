@@ -91,7 +91,8 @@ Enter the task at the prompt. The pod uses its ServiceAccount token through the 
 configuration; it does not need a mounted kubeconfig. It remains interactive because approvals and the
 task are entered in the terminal. Detaching does not stop the process; reconnect with the attach command.
 The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
-After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
+The artifact list includes manifests written, read, or applied during the current task; unrelated files left
+from earlier tasks are not included automatically. After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
 discard them, or push them to GitHub. Include `repository: owner/name` and `branch: branch-name` in the task
 when requesting a push. Publishing creates one commit containing only manifests written during that task,
 under `manifests/` in the target repository; use `.` at the publish prompt to put them at the repository
