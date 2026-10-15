@@ -15,7 +15,6 @@ Setup:
     pip install groq "kubernetes>=29" pyyaml
     (optional) export GROQ_API_KEY="your-key"
 """
-import base64
 import getpass
 import json
 import os
@@ -427,147 +426,234 @@ def pod_exec(command, pod="", pods=None, namespace="", container="", timeout_sec
     return cut("\n".join(_exec_one(ns, t, command, container, int(timeout_seconds)) for t in targets))
 
 
-class GitHubAPIError(RuntimeError):
+class GitRemoteAPIError(RuntimeError):
     def __init__(self, status, detail):
-        super().__init__(f"GitHub API returned {status}: {detail}")
+        super().__init__(f"Git hosting API returned {status}: {detail}")
         self.status = status
 
 
-def redact_secret_manifest(filename, content):
-    docs = [doc for doc in yaml.safe_load_all(content) if doc]
-    has_secret = False
-    for doc in docs:
-        if doc.get("kind") != "Secret":
-            continue
-        has_secret = True
-        metadata = doc.setdefault("metadata", {})
-        name = metadata.get("name", "secret")
-        metadata["name"] = f"{name.removesuffix('-example')}-example"
-        annotations = metadata.setdefault("annotations", {})
-        annotations["k8s-ai-agent.example/redacted"] = "true"
-        for field in ("data", "stringData"):
-            values = doc.get(field) or {}
-            for key in values:
-                values[key] = (base64.b64encode(b"REPLACE_BEFORE_USE").decode()
-                               if field == "data" else "REPLACE_BEFORE_USE")
-    if not has_secret:
-        return filename, content, False
-    return filename + ".example", yaml.safe_dump_all(docs, sort_keys=False), True
+def parse_repository_target(value):
+    value = value.strip().rstrip(".,)")
+    if not value.startswith(("http://", "https://")):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", value):
+            raise ValueError("repository must be a URL or namespace/project")
+        return "github", "https://github.com", value.removesuffix(".git"), ""
+
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https":
+        raise ValueError("repository URLs must use HTTPS")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("repository URL must include a host and must not contain credentials")
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    branch = ""
+    for marker in ("-", "tree"):
+        if marker in parts:
+            index = parts.index(marker)
+            if marker == "-" and index + 1 < len(parts) and parts[index + 1] == "tree":
+                branch = "/".join(parts[index + 2:])
+            elif marker == "tree":
+                branch = "/".join(parts[index + 1:])
+            parts = parts[:index]
+            break
+    project = "/".join(parts).removesuffix(".git")
+    if not project:
+        raise ValueError("repository URL must include a project path")
+    host = parsed.hostname.lower()
+    if host == "github.com" or "github" in host:
+        provider = "github"
+    elif host == "gitlab.com" or "gitlab" in host:
+        provider = "gitlab"
+    else:
+        provider = ""
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return provider, origin, project, branch
 
 
-def github_api(method, endpoint, token, payload=None):
+def hosting_api(method, url, token="", provider="github", payload=None):
     body = json.dumps(payload).encode() if payload is not None else None
-    request = urllib.request.Request(
-        f"https://api.github.com{endpoint}", data=body, method=method,
-        headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}",
-                 "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"})
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if token:
+        headers["PRIVATE-TOKEN" if provider == "gitlab" else "Authorization"] = (
+            token if provider == "gitlab" else f"Bearer {token}")
+    if provider == "github":
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read()) if response.status != 204 else {}
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
-        raise GitHubAPIError(e.code, detail) from None
+        raise GitRemoteAPIError(e.code, detail) from None
+
+
+def detect_git_provider(provider, origin):
+    if provider:
+        return provider
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    gitlab_token = os.environ.get("GITLAB_TOKEN", "")
+    if gitlab_token and not github_token:
+        return "gitlab"
+    if github_token and not gitlab_token:
+        return "github"
+    try:
+        hosting_api("GET", f"{origin}/api/v4/version", gitlab_token, "gitlab")
+        return "gitlab"
+    except GitRemoteAPIError:
+        try:
+            hosting_api("GET", f"{origin}/api/v3", github_token, "github")
+            return "github"
+        except GitRemoteAPIError:
+            raise ValueError("could not identify this Git host; use a GitHub/GitLab URL and configure its token")
+
+
+def push_github_manifests(api_root, project, branch, directory, publishable, token):
+    api_repo = f"{api_root}/repos/{project}"
+    repository = hosting_api("GET", api_repo, token, "github")
+    default_branch = repository.get("default_branch")
+    if not default_branch:
+        raise RuntimeError(f"repository {project} has no default branch")
+    branch = branch or default_branch
+    ref_endpoint = f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
+    try:
+        ref = hosting_api("GET", ref_endpoint, token, "github")
+    except GitRemoteAPIError as error:
+        if error.status != 404:
+            raise
+        source_ref = hosting_api(
+            "GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(default_branch, safe='/')}", token, "github")
+        ref = hosting_api("POST", f"{api_root}/repos/{project}/git/refs", token, "github",
+                          {"ref": f"refs/heads/{branch}", "sha": source_ref["object"]["sha"]})
+        print(f"Created branch {branch} from {default_branch}")
+    parent_sha = ref["object"]["sha"]
+    parent = hosting_api("GET", f"{api_repo}/git/commits/{parent_sha}", token, "github")
+    entries = []
+    for filename, content in publishable:
+        blob = hosting_api("POST", f"{api_repo}/git/blobs", token, "github",
+                           {"content": content, "encoding": "utf-8"})
+        path = "/".join(part for part in (directory, filename) if part)
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+    tree = hosting_api("POST", f"{api_repo}/git/trees", token, "github",
+                       {"base_tree": parent["tree"]["sha"], "tree": entries})
+    commit = hosting_api("POST", f"{api_repo}/git/commits", token, "github",
+                         {"message": "Add Kubernetes manifests from k8s-ai-agent",
+                          "tree": tree["sha"], "parents": [parent_sha]})
+    hosting_api("PATCH", f"{api_repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}",
+                token, "github", {"sha": commit["sha"], "force": False})
+    return branch, commit["sha"]
+
+
+def push_gitlab_manifests(api_root, project, branch, directory, publishable, token):
+    encoded_project = urllib.parse.quote(project, safe="")
+    api_project = f"{api_root}/projects/{encoded_project}"
+    repository = hosting_api("GET", api_project, token, "gitlab")
+    default_branch = repository.get("default_branch")
+    if not default_branch:
+        raise RuntimeError(f"repository {project} has no default branch")
+    branch = branch or default_branch
+    branch_path = urllib.parse.quote(branch, safe="")
+    try:
+        hosting_api("GET", f"{api_project}/repository/branches/{branch_path}", token, "gitlab")
+    except GitRemoteAPIError as error:
+        if error.status != 404:
+            raise
+        query = urllib.parse.urlencode({"branch": branch, "ref": default_branch})
+        hosting_api("POST", f"{api_project}/repository/branches?{query}", token, "gitlab")
+        print(f"Created branch {branch} from {default_branch}")
+
+    actions = []
+    for filename, content in publishable:
+        path = "/".join(part for part in (directory, filename) if part)
+        query = urllib.parse.urlencode({"ref": branch})
+        try:
+            hosting_api("GET", f"{api_project}/repository/files/{urllib.parse.quote(path, safe='')}?{query}",
+                        token, "gitlab")
+            action = "update"
+        except GitRemoteAPIError as error:
+            if error.status != 404:
+                raise
+            action = "create"
+        actions.append({"action": action, "file_path": path, "content": content})
+    commit = hosting_api("POST", f"{api_project}/repository/commits", token, "gitlab",
+                         {"branch": branch, "commit_message": "Add Kubernetes manifests from k8s-ai-agent",
+                          "actions": actions})
+    return branch, commit["id"]
 
 
 def push_task_manifests(repo, branch, directory="manifests"):
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-        raise ValueError("repository must be owner/name")
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith("-"):
+    provider, origin, project, url_branch = parse_repository_target(repo)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", project):
+        raise ValueError("repository project path contains unsupported characters")
+    branch = branch or url_branch
+    if branch and (not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith("-")):
         raise ValueError("invalid branch name")
     directory = "" if directory.strip() in ("", ".") else directory.strip("/")
     if directory and not re.fullmatch(r"[A-Za-z0-9._/-]+", directory):
         raise ValueError("destination directory contains unsupported characters")
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN is not set; configure it in the agent-credentials Secret")
     if not TASK_MANIFESTS:
         raise RuntimeError("no manifest files were written, read, or applied during this task")
 
-    publishable = []
-    for filename in sorted(TASK_MANIFESTS):
-        content = manifest_path(filename).read_text()
-        remote_filename, content, has_secret = redact_secret_manifest(filename, content)
-        if has_secret:
-            print(f"Redacted Secret values from {filename}; publishing as {remote_filename}")
-        publishable.append((remote_filename, content))
-    if not publishable:
-        raise ValueError("no manifests are available to publish")
+    provider = detect_git_provider(provider, origin or "")
+    if provider == "github":
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            raise RuntimeError("GITHUB_TOKEN is not set in the agent credentials Secret")
+        api_root = "https://api.github.com" if origin == "https://github.com" else f"{origin}/api/v3"
+    else:
+        token = os.environ.get("GITLAB_TOKEN", "")
+        if not token:
+            raise RuntimeError("GITLAB_TOKEN is not set in the agent credentials Secret")
+        api_root = f"{origin}/api/v4"
 
-    api_repo = "/repos/" + repo
-    branch_ref = f"refs/heads/{branch}"
-    ref_endpoint = f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
-    try:
-        ref = github_api("GET", ref_endpoint, token)
-    except GitHubAPIError as e:
-        if e.status != 404:
-            raise
-        repository = github_api("GET", api_repo, token)
-        default_branch = repository.get("default_branch")
-        if not default_branch:
-            raise RuntimeError(f"repository {repo} has no default branch to base '{branch}' on") from e
-        source_ref = github_api(
-            "GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(default_branch, safe='/')}", token)
-        try:
-            ref = github_api("POST", f"{api_repo}/git/refs", token,
-                             {"ref": branch_ref, "sha": source_ref["object"]["sha"]})
-            print(f"Created branch {branch} from {default_branch}")
-        except GitHubAPIError as create_error:
-            if create_error.status != 422:
-                raise
-            ref = github_api("GET", ref_endpoint, token)
-    parent_sha = ref["object"]["sha"]
-    parent = github_api("GET", f"{api_repo}/git/commits/{parent_sha}", token)
-    entries = []
-    for filename, content in publishable:
-        blob = github_api("POST", f"{api_repo}/git/blobs", token,
-                          {"content": content, "encoding": "utf-8"})
-        path = "/".join(part for part in (directory, filename) if part)
-        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-
-    tree = github_api("POST", f"{api_repo}/git/trees", token,
-                      {"base_tree": parent["tree"]["sha"], "tree": entries})
-    commit = github_api("POST", f"{api_repo}/git/commits", token,
-                        {"message": "Add Kubernetes manifests from k8s-ai-agent",
-                         "tree": tree["sha"], "parents": [parent_sha]})
-    github_api("PATCH", f"{api_repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}", token,
-               {"sha": commit["sha"], "force": False})
-    return f"Pushed {len(entries)} manifest(s) to {repo}@{branch} ({commit['sha'][:7]})"
+    publishable = [(filename, manifest_path(filename).read_text())
+                   for filename in sorted(TASK_MANIFESTS)]
+    if provider == "github":
+        branch, commit_sha = push_github_manifests(api_root, project, branch, directory,
+                                                   publishable, token)
+    else:
+        branch, commit_sha = push_gitlab_manifests(api_root, project, branch, directory,
+                                                   publishable, token)
+    remote = f"{origin}/{project}" if origin else project
+    return f"Pushed {len(publishable)} manifest(s) to {remote}@{branch} ({commit_sha[:7]})"
 
 
 def finish_task(report, task):
     if not report or not report.lstrip().startswith("TASK STATUS: PASS") or not TASK_MANIFESTS:
         return
     print("\nTask validated. Manifest files included: " + ", ".join(sorted(TASK_MANIFESTS)))
-    choice = input("Artifacts: [l] keep in pod, [g] push to GitHub, [d] discard: ").strip().lower()
+    choice = input("Artifacts: [l] keep in pod, [g] push to GitHub/GitLab, [d] discard: ").strip().lower()
     if choice in ("", "l", "local"):
         print(f"Kept in {MANIFEST_DIR} (pod-local storage; removed when the pod is replaced).")
     elif choice in ("d", "discard"):
         for filename in TASK_MANIFESTS:
             manifest_path(filename).unlink(missing_ok=True)
         print("Removed this task's generated manifest files.")
-    elif choice in ("g", "github"):
+    elif choice in ("g", "github", "git"):
         repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*[:=]\s*([^\s]+)", task)
-        url_match = re.search(r"https?://github\.com/([^/\s]+/[^/\s#]+)", task)
+        url_match = re.search(r"https?://[^\s]+", task)
         branch_match = re.search(r"(?im)^\s*branch\s*[:=]\s*([^\s]+)", task)
         natural_branch = re.search(r"(?i)\b([A-Za-z0-9][A-Za-z0-9._/-]*)\s+branch\b", task)
         report_repo = re.search(r"(?im)^\s*repository\s*:\s*([^\s]+)", report)
         report_branch = re.search(r"(?im)^\s*branch\s*:\s*([^\s]+)", report)
         repo_default = (report_repo.group(1) if report_repo else
-                repo_match.group(1) if repo_match else
-                url_match.group(1).removesuffix(".git") if url_match else "")
+                        repo_match.group(1) if repo_match else
+                        url_match.group(0).rstrip(".,);]") if url_match else "")
+        try:
+            _, _, _, url_branch = parse_repository_target(repo_default)
+        except ValueError:
+            url_branch = ""
         branch_default = (report_branch.group(1) if report_branch else
                           branch_match.group(1) if branch_match else
-                          natural_branch.group(1) if natural_branch else "")
+                          natural_branch.group(1) if natural_branch else url_branch)
         directory_default = "manifests"
         while True:
-            repo = input(f"GitHub repository owner/name [{repo_default}]: ").strip() or repo_default
-            branch = input(f"Target branch [{branch_default}]: ").strip() or branch_default
+            repo = input(f"Repository URL or owner/project [{repo_default}]: ").strip() or repo_default
+            branch = input(f"Target branch [default: {branch_default or 'repository default'}]: ").strip() or branch_default
             directory = input(f"Repository directory [{directory_default}]: ").strip() or directory_default
             try:
                 print(push_task_manifests(repo, branch, directory))
                 break
             except Exception as e:
-                print(f"GitHub publish failed: {type(e).__name__}: {e}")
+                print(f"Git publish failed: {type(e).__name__}: {e}")
                 if input("Retry GitHub push? [y/N]: ").strip().lower() != "y":
                     break
     else:
@@ -663,7 +749,7 @@ TOOL_SPECS = [
          {"pod": S, "container": S, "namespace": NSP, "previous": {"type": "boolean"}, "tail": INT}, ["pod"]),
     tool("write_manifest", "Save YAML (may hold several --- documents) to ~/manifest/<filename>, e.g. 20-statefulset.yaml. "
             "Follow the user's requested configuration. For Secret integration, support env.valueFrom.secretKeyRef "
-            "or envFrom.secretRef as requested; Secret values are stored locally and redacted on GitHub publishing.",
+            "or envFrom.secretRef as requested; publishing commits manifest contents exactly as saved.",
          {"filename": S, "content": S}, ["filename", "content"]),
     tool("read_manifest", "Read a saved manifest file.", {"filename": S}, ["filename"]),
     tool("apply_manifest", "Server-side apply a saved manifest file to the cluster.", {"filename": S}, ["filename"]),

@@ -31,7 +31,7 @@ end up with the final working YAML on disk.
 - Docker, Helm 3, and `kubectl`
 - A Groq API key (https://console.groq.com/keys) with access to a tool-calling model
   (for example `openai/gpt-oss-120b`)
-- A GitHub token with Contents read/write access if tasks should publish manifests to GitHub
+- A GitHub or GitLab token with repository write access if tasks should publish manifests
 - Cluster permissions for whatever your task needs (RBAC applies as usual)
 
 ## Build and deploy with Docker and Helm
@@ -44,8 +44,8 @@ docker build -t ghcr.io/YOUR_ORG/k8s-ai-agent:latest .
 docker push ghcr.io/YOUR_ORG/k8s-ai-agent:latest
 ```
 
-The chart creates a credentials Secret when either credential is supplied. The Groq key is required by the
-agent; the GitHub token is optional and is only needed to publish manifests. Enter the keys as plain text,
+The chart creates a credentials Secret when a credential is supplied. The Groq key is required by the
+agent; GitHub and GitLab tokens are optional and are only needed to publish manifests to those hosts. Enter the keys as plain text,
 without base64 encoding, and without echoing them. The chart applies Helm's `b64enc` to populate Kubernetes
 Secret `data`; then install the chart, which creates the namespace and chart resources:
 
@@ -54,21 +54,24 @@ read -r -s -p "Groq API key: " GROQ_API_KEY
 echo
 read -r -s -p "GitHub token (optional; press Enter to skip): " GITHUB_TOKEN
 echo
+read -r -s -p "GitLab token (optional; press Enter to skip): " GITLAB_TOKEN
+echo
 helm upgrade --install k8s-ai-agent ./charts/k8s-ai-agent \
   --namespace k8s-ai-agent \
   --create-namespace \
   --set image.repository=ghcr.io/YOUR_ORG/k8s-ai-agent \
   --set image.tag=latest \
   --set-string credentials.groqApiKey="$GROQ_API_KEY" \
-  --set-string credentials.githubToken="$GITHUB_TOKEN"
-unset GROQ_API_KEY GITHUB_TOKEN
+  --set-string credentials.githubToken="$GITHUB_TOKEN" \
+  --set-string credentials.gitlabToken="$GITLAB_TOKEN"
+unset GROQ_API_KEY GITHUB_TOKEN GITLAB_TOKEN
 
 kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app.kubernetes.io/instance=k8s-ai-agent -o name | head -n 1)
 ```
 
 The chart creates the Namespace (through `--create-namespace`), Deployment, ServiceAccount, ClusterRole,
 and ClusterRoleBinding. When either credential is non-empty, it creates a Secret with only the supplied
-key or keys and references it from the Deployment. If both are empty, the Deployment references the
+key or keys and references it from the Deployment. If all are empty, the Deployment references the
 existing Secret named by `existingCredentialsSecret` (default `agent-credentials`). Helm stores supplied
 credential values in release metadata, so restrict access to the Helm release and use a cluster secret
 manager for production.
@@ -82,7 +85,8 @@ Common chart settings can be overridden with `--set` or a values file:
 | `groq.model` | `openai/gpt-oss-120b` | Groq chat model |
 | `replicaCount` | `1` | Number of agent pods |
 | `credentials.groqApiKey` | `""` | Groq key; a non-empty value causes chart-managed Secret creation |
-| `credentials.githubToken` | `""` | Optional GitHub token; a non-empty value causes chart-managed Secret creation |
+| `credentials.githubToken` | `""` | Optional GitHub token for GitHub.com or GitHub Enterprise |
+| `credentials.gitlabToken` | `""` | Optional GitLab token for GitLab.com or self-managed GitLab |
 | `existingCredentialsSecret` | `agent-credentials` | Secret referenced only when both credential values are empty |
 | `rbac.create` | `true` | Create the chart's ClusterRole and ClusterRoleBinding |
 | `serviceAccount.create` | `true` | Create the ServiceAccount used by the agent |
@@ -93,14 +97,15 @@ task are entered in the terminal. Detaching does not stop the process; reconnect
 The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
 The artifact list includes manifests written, read, or applied during the current task; unrelated files left
 from earlier tasks are not included automatically. After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
-discard them, or push them to GitHub. Include `repository: owner/name` and `branch: branch-name` in the task
-when requesting a push. Publishing creates one commit containing only manifests written during that task,
-under `manifests/` in the target repository; use `.` at the publish prompt to put them at the repository
-root. If the requested branch does not exist, the agent creates it from the repository's default branch.
-Files containing Kubernetes Secret resources are published as redacted learning examples named
-`*.yaml.example`: secret values become `REPLACE_BEFORE_USE`, the resource name gets an `-example` suffix,
-and a redaction annotation is added. The real password in the live Secret manifest is never committed.
-The GitHub token is used only for the publish request and is never included in the commit.
+discard them, or push them to GitHub/GitLab. Include `repository: URL` and `branch: branch-name` in the task
+when requesting a push. Give the full GitHub/GitLab repository URL in the task; custom GitHub Enterprise and
+self-managed GitLab URLs are supported. The publish prompt accepts a full URL or `owner/project`, and defaults
+to the task's URL and branch when present. Publishing creates one commit containing only manifests included in
+that task, under `manifests/` in the target repository; use `.` at the publish prompt to put them at the
+repository root. If the requested branch does not exist, the agent creates it from the repository's default
+branch. Files, including Secret manifests, are committed exactly as saved: Secret values are not redacted.
+Use this only when you intend those credentials to be stored in the repository; the GitHub or GitLab token is
+used only for publishing and is never included in the commit.
 
 The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
@@ -140,7 +145,7 @@ want (for example, three independent databases instead of real replication).
 | `k8s_get` | Get or list any kind (including CRDs); `path` returns only part of an object | no |
 | `k8s_events` | Recent events for a namespace or object | no |
 | `pod_logs` | Container logs, including previous crashed container | no |
-| `write_manifest` | Save YAML to `~/manifest/<file>`; Secret values are stored locally and redacted on GitHub publish | no |
+| `write_manifest` | Save YAML to `~/manifest/<file>`; Secret values are stored locally and committed unchanged on publish | no |
 | `read_manifest` | Read a saved manifest | no |
 | `apply_manifest` | Server-side apply of a saved manifest file | **yes** (`a` = always this run) |
 | `wait_until_ready` | Wait for StatefulSet/Deployment/Pod/Job; returns early with evidence if pods are stuck | no |
@@ -160,9 +165,9 @@ want (for example, three independent databases instead of real replication).
 - **The running agent has no host shell or kubectl.** The operator uses `kubectl` to install the Helm
   chart, create the credentials Secret, and attach to the pod; the agent itself talks to Kubernetes via
   the Python client and only writes task manifests into its `~/manifest` directory.
-- **Secret values are exposed in this mode.** Secret YAML is saved locally and its values are included in model
-  tool history. GitHub publishing replaces values with `REPLACE_BEFORE_USE` in an `*.yaml.example` file, but
-  protect local manifests and avoid pushing raw Secret YAML outside the agent's publish workflow.
+- **Secret values are exposed in this mode.** Secret YAML is saved locally, its values are included in model
+  tool history, and publishing commits them unchanged. Use this only for demo credentials you intend to store
+  in the repository; protect local manifests and never publish production credentials.
 - Credential sourcing follows the task: users can request literal environment values, per-key
   `env.valueFrom.secretKeyRef`, `envFrom.secretRef`, or another source. When a required credential has no
   specified source or Secret injection style, the agent asks instead of choosing one.

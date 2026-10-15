@@ -19,6 +19,7 @@ rbac:
 credentials:
   groqApiKey: ""
   githubToken: ""
+  gitlabToken: ""
 
 existingCredentialsSecret: agent-credentials
 
