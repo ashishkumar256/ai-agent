@@ -617,16 +617,18 @@ def push_task_manifests(repo, branch, directory="manifests"):
 
 
 def finish_task(report, task):
-    if not report or not report.lstrip().startswith("TASK STATUS: PASS") or not TASK_MANIFESTS:
-        return
-    print("\nTask validated. Manifest files included: " + ", ".join(sorted(TASK_MANIFESTS)))
+    if not report or not report.lstrip().startswith("TASK STATUS: PASS"):
+        return "Publishing not performed because the task did not pass validation."
+    if not TASK_MANIFESTS:
+        return "Publishing not performed because no task manifests were tracked."
+    print("\nTask validated. Task manifests included: " + ", ".join(sorted(TASK_MANIFESTS)))
     choice = input("Artifacts: [l] keep in pod, [g] push to GitHub/GitLab, [d] discard: ").strip().lower()
     if choice in ("", "l", "local"):
-        print(f"Kept in {MANIFEST_DIR} (pod-local storage; removed when the pod is replaced).")
+        return f"Artifacts kept in {MANIFEST_DIR}; repository publishing was not performed."
     elif choice in ("d", "discard"):
         for filename in TASK_MANIFESTS:
             manifest_path(filename).unlink(missing_ok=True)
-        print("Removed this task's generated manifest files.")
+        return "Task manifests discarded; repository publishing was not performed."
     elif choice in ("g", "github", "git"):
         repo_match = re.search(r"(?im)^\s*repo(?:sitory)?\s*[:=]\s*([^\s]+)", task)
         url_match = re.search(r"https?://[^\s]+", task)
@@ -650,14 +652,22 @@ def finish_task(report, task):
             branch = input(f"Target branch [default: {branch_default or 'repository default'}]: ").strip() or branch_default
             directory = input(f"Repository directory [{directory_default}]: ").strip() or directory_default
             try:
-                print(push_task_manifests(repo, branch, directory))
-                break
+                return push_task_manifests(repo, branch, directory)
             except Exception as e:
                 print(f"Git publish failed: {type(e).__name__}: {e}")
-                if input("Retry GitHub push? [y/N]: ").strip().lower() != "y":
-                    break
+                if input("Retry publish? [y/N]: ").strip().lower() != "y":
+                    return "Repository publishing failed or was cancelled; no successful push was confirmed."
     else:
-        print("Unrecognized choice; files remain in the pod-local manifest directory.")
+        return f"Unrecognized choice; manifests remain in {MANIFEST_DIR} and were not published."
+
+
+def format_final_report(report, artifact_result):
+    lines = report.splitlines()
+    status = next((line.strip() for line in lines
+                   if line.strip().startswith("TASK STATUS:")), "TASK STATUS: FAIL")
+    details = [line for line in lines if line.strip() != status
+               and not re.search(r"\b(committed|commit|pushed|push|published|publish)\b", line, re.IGNORECASE)]
+    return "\n".join([status, *details, f"Repository publishing: {artifact_result}"])
 
 
 def k8s_delete(kind, api_version, name, namespace=""):
@@ -775,8 +785,8 @@ Workflow:
     whether to use literal environment values, env.valueFrom.secretKeyRef, envFrom.secretRef, or another source.
     For every StatefulSet, create and apply the Service named by spec.serviceName before applying the StatefulSet.
     Include the Service manifest in task artifacts. Apply Secret manifests before workloads that reference them.
-    Secret values in manifests are present in local files and model tool history; GitHub publishing replaces
-    them with placeholders.
+    Secret values in manifests are present in local files and model tool history; publishing commits exact
+    manifest contents.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).
@@ -786,9 +796,10 @@ Workflow:
 5. If requirements are unclear or a prerequisite is missing, ask the user in plain text.
 6. If the user denies an action, do not retry; explain what you need.
 7. Final report, short: begin with exactly `TASK STATUS: PASS` only when all requested changes and
-    validations succeeded; otherwise begin with `TASK STATUS: FAIL`. Include files written, checks with
-    evidence, and caveats. When GitHub publishing is requested, include `repository: owner/name` and
-    `branch: branch-name` in the report.
+    validations succeeded; otherwise begin with `TASK STATUS: FAIL`. Include files actually written, checks
+    with evidence, and caveats. Never claim files were pushed, published, or committed. Repository publishing
+    happens only after this report, when the user chooses it at the artifact prompt; actual results are reported
+    by the publisher.
 Be concise between tool calls."""
 
 
@@ -949,7 +960,7 @@ def run_agent(messages):
                                                  "arguments": tc.function.arguments or "{}"}}
                                    for tc in msg.tool_calls]
         messages.append(entry)
-        if msg.content:
+        if msg.content and msg.tool_calls:
             print(f"\nAgent: {msg.content}")
         if not msg.tool_calls:
             print(f"\n(session total: {STATS['calls']} calls, {STATS['tokens']} tokens)")
@@ -1033,7 +1044,9 @@ def main():
                 {"role": "user", "content": task}]
     TASK_MANIFESTS.clear()
     report = run_agent(messages)
-    finish_task(report, task)
+    artifact_result = finish_task(report, task)
+    if report:
+        print(f"\nAgent: {format_final_report(report, artifact_result)}")
 
     while True:                                              # follow-up chat, same memory
         follow = input("\nYou (or 'exit'): ").strip()
@@ -1048,7 +1061,9 @@ def main():
         messages.append({"role": "user", "content": follow})
         TASK_MANIFESTS.clear()
         report = run_agent(messages)
-        finish_task(report, follow)
+        artifact_result = finish_task(report, follow)
+        if report:
+            print(f"\nAgent: {format_final_report(report, artifact_result)}")
 
 
 if __name__ == "__main__":
