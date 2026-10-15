@@ -6,7 +6,7 @@ Just run:   python k8s_agent.py
 Prompts: Groq key (if GROQ_API_KEY is not set), model, kube context, the task, approvals.
 
 - Cluster access comes from ~/.kube/config (or $KUBECONFIG).
-- The model writes manifests as files into ~/manifest, then applies them (server-side apply).
+- The model writes manifests as files into ~/manifest (or $MANIFEST_DIR), then applies them (server-side apply).
 - Every change (apply, secret, exec, delete) and every new namespace needs your approval.
 - Built for Groq's per-minute limits: reads the rate-limit headers and waits when needed, retries on 429,
   trims old history, keeps tool output small, and offers one-call tools to save requests.
@@ -14,18 +14,17 @@ Prompts: Groq key (if GROQ_API_KEY is not set), model, kube context, the task, a
 Setup:
     pip install groq "kubernetes>=29" pyyaml
     (optional) export GROQ_API_KEY="your-key"
+
+Docker:     docker compose run --rm k8s-agent      (see docker-compose.yaml)
 """
-import base64
 import getpass
 import json
 import os
 import re
+import secrets
 import shlex
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import yaml
@@ -46,15 +45,14 @@ MAX_TOOL_OUTPUT = 2500    # max characters of any tool result sent to the model
 MAX_STEPS = 60
 # -----------------------------------------------------------------------------------------------
 
-MANIFEST_DIR = Path.home() / "manifest"
+# Where manifests are written. Default ~/manifest; override with $MANIFEST_DIR (the Docker image sets /manifest).
+MANIFEST_DIR = Path(os.environ.get("MANIFEST_DIR") or Path.home() / "manifest").expanduser()
 FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml")
 
-MUTATING = {"apply_manifest", "pod_exec", "k8s_delete"}
+MUTATING = {"apply_manifest", "generate_secret", "pod_exec", "k8s_delete"}
 ALWAYS_ASK = {"k8s_delete"}         # never offered the "always" shortcut
 approved_always = set()
 APPROVED_NS = []                    # namespaces the user approved this run (first = default)
-TASK_MANIFESTS = set()
-PUBLISH_TARGET = {}
 
 core = None                         # CoreV1Api
 dyn = None                          # DynamicClient (any kind / CRD)
@@ -69,76 +67,6 @@ def cut(text, n=None):
     n = n or MAX_TOOL_OUTPUT
     text = str(text)
     return text if len(text) <= n else text[:n] + f"\n...[truncated {len(text) - n} chars]"
-
-
-def secret_values():
-    values = set()
-    for filename in TASK_MANIFESTS:
-        path = manifest_path(filename)
-        if not path.is_file():
-            continue
-        try:
-            docs = [doc for doc in yaml.safe_load_all(path.read_text()) if isinstance(doc, dict)]
-        except (OSError, yaml.YAMLError):
-            continue
-        for doc in docs:
-            if doc.get("kind") != "Secret":
-                continue
-            for field in ("stringData", "data"):
-                for raw_value in (doc.get(field) or {}).values():
-                    value = str(raw_value)
-                    if value:
-                        values.add(value)
-                    if field == "data" and value:
-                        try:
-                            decoded = base64.b64decode(value).decode()
-                            if decoded:
-                                values.add(decoded)
-                        except (ValueError, UnicodeDecodeError):
-                            pass
-    return sorted(values, key=len, reverse=True)
-
-
-def mask_secret_values(text):
-    text = str(text)
-    for value in secret_values():
-        text = text.replace(value, "*" * len(value))
-    return text
-
-
-def mask_manifest_for_display(content):
-    try:
-        docs = [doc for doc in yaml.safe_load_all(content) if doc]
-    except yaml.YAMLError:
-        return mask_secret_values(content)
-    changed = False
-    for doc in docs:
-        if not isinstance(doc, dict) or doc.get("kind") != "Secret":
-            continue
-        for field in ("stringData", "data"):
-            values = doc.get(field) or {}
-            for key in values:
-                values[key] = "*" * len(str(values[key]))
-                changed = True
-    return mask_secret_values(yaml.safe_dump_all(docs, sort_keys=False) if changed else content)
-
-
-def mask_secret_manifest_for_publish(content):
-    docs = [doc for doc in yaml.safe_load_all(content) if doc]
-    for doc in docs:
-        if not isinstance(doc, dict) or doc.get("kind") != "Secret":
-            continue
-        data_values = doc.get("data") or {}
-        for key, encoded in data_values.items():
-            try:
-                decoded = base64.b64decode(str(encoded), validate=True)
-                data_values[key] = base64.b64encode(b"*" * len(decoded)).decode("ascii")
-            except (ValueError, TypeError):
-                data_values[key] = "*" * len(str(encoded))
-        for values in (doc.get("stringData") or {},):
-            for key, value in values.items():
-                values[key] = "*" * len(str(value))
-    return yaml.safe_dump_all(docs, sort_keys=False)
 
 
 def as_bool(v):
@@ -235,15 +163,12 @@ def write_manifest(filename, content):
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
     existed = path.exists()
     path.write_text(content if content.endswith("\n") else content + "\n")
-    TASK_MANIFESTS.add(filename)
     what = ", ".join(f"{d['kind']}/{d['metadata']['name']}" for d in docs)
     return f"{'Updated' if existed else 'Wrote'} {path} containing: {what}"
 
 
 def read_manifest(filename):
-    content = manifest_path(filename).read_text()
-    TASK_MANIFESTS.add(filename)
-    return cut(content, 6000)
+    return cut(manifest_path(filename).read_text(), 6000)
 
 
 # --------------------------------------------------------------------------
@@ -252,7 +177,6 @@ def read_manifest(filename):
 def apply_manifest(filename):
     """Server-side apply every document in ~/manifest/<filename>."""
     docs = load_docs(manifest_path(filename))
-    TASK_MANIFESTS.add(filename)
     file_ns = {d["metadata"]["name"] for d in docs if d["kind"] == "Namespace"}
     plan = []                                    # validate everything first, apply after
     for d in docs:
@@ -270,27 +194,6 @@ def apply_manifest(filename):
                                       f"(only Namespace objects)")
             ns = None
         plan.append((res, d, ns))
-
-    planned_services = {(ns, d["metadata"]["name"])
-                        for _, d, ns in plan if d["kind"] == "Service"}
-    service_res = dyn.resources.get(api_version="v1", kind="Service")
-    for _, d, ns in plan:
-        if d["kind"] != "StatefulSet":
-            continue
-        service_name = (d.get("spec") or {}).get("serviceName")
-        if not service_name or (ns, service_name) in planned_services:
-            continue
-        try:
-            service_res.get(name=service_name, namespace=ns)
-        except ApiException as e:
-            if e.status == 404:
-                raise ValueError(
-                    f"StatefulSet/{d['metadata']['name']} requires Service/{service_name} "
-                    f"in namespace {ns}; write and apply its Service manifest first") from e
-            raise
-
-    plan.sort(key=lambda item: 0 if item[1]["kind"] == "Namespace"
-              else 1 if item[1]["kind"] == "Service" else 2)
 
     done = []
     for res, d, ns in plan:
@@ -343,9 +246,6 @@ def k8s_get(kind, api_version, namespace="", name="", label_selector="", path=""
     ns = ns_for(res, namespace)
     if name:
         obj = res.get(name=name, namespace=ns).to_dict()
-        if kind == "Secret":
-            obj.pop("data", None)
-            obj.pop("stringData", None)
         meta = obj.get("metadata", {})
         meta.pop("managedFields", None)
         if "annotations" in meta:
@@ -498,266 +398,20 @@ def pod_exec(command, pod="", pods=None, namespace="", container="", timeout_sec
     return cut("\n".join(_exec_one(ns, t, command, container, int(timeout_seconds)) for t in targets))
 
 
-class GitRemoteAPIError(RuntimeError):
-    def __init__(self, status, detail):
-        super().__init__(f"Git hosting API returned {status}: {detail}")
-        self.status = status
-
-
-def parse_repository_target(value):
-    value = value.strip().rstrip(".,)")
-    if not value.startswith(("http://", "https://")):
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", value):
-            raise ValueError("repository must be a URL or namespace/project")
-        return "github", "https://github.com", value.removesuffix(".git"), ""
-
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme != "https":
-        raise ValueError("repository URLs must use HTTPS")
-    if not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("repository URL must include a host and must not contain credentials")
-    parts = [part for part in parsed.path.strip("/").split("/") if part]
-    branch = ""
-    for marker in ("-", "tree"):
-        if marker in parts:
-            index = parts.index(marker)
-            if marker == "-" and index + 1 < len(parts) and parts[index + 1] == "tree":
-                branch = "/".join(parts[index + 2:])
-            elif marker == "tree":
-                branch = "/".join(parts[index + 1:])
-            parts = parts[:index]
-            break
-    project = "/".join(parts).removesuffix(".git")
-    if not project:
-        raise ValueError("repository URL must include a project path")
-    host = parsed.hostname.lower()
-    if host == "github.com" or "github" in host:
-        provider = "github"
-    elif host == "gitlab.com" or "gitlab" in host:
-        provider = "gitlab"
-    else:
-        provider = ""
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    return provider, origin, project, branch
-
-
-def hosting_api(method, url, token="", provider="github", payload=None):
-    body = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    if token:
-        headers["PRIVATE-TOKEN" if provider == "gitlab" else "Authorization"] = (
-            token if provider == "gitlab" else f"Bearer {token}")
-    if provider == "github":
-        headers["X-GitHub-Api-Version"] = "2022-11-28"
-    request = urllib.request.Request(url, data=body, method=method, headers=headers)
+def generate_secret(name, keys, namespace=""):
+    """Create a Secret with random values (values are never shown to the model)."""
+    ns = pick_ns(namespace)
+    keys = [str(k) for k in as_list(keys, ",")]
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read()) if response.status != 204 else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:500]
-        raise GitRemoteAPIError(e.code, detail) from None
-
-
-def detect_git_provider(provider, origin):
-    if provider:
-        return provider
-    github_token = os.environ.get("GITHUB_TOKEN", "")
-    gitlab_token = os.environ.get("GITLAB_TOKEN", "")
-    if gitlab_token and not github_token:
-        return "gitlab"
-    if github_token and not gitlab_token:
-        return "github"
-    try:
-        hosting_api("GET", f"{origin}/api/v4/version", gitlab_token, "gitlab")
-        return "gitlab"
-    except GitRemoteAPIError:
-        try:
-            hosting_api("GET", f"{origin}/api/v3", github_token, "github")
-            return "github"
-        except GitRemoteAPIError:
-            raise ValueError("could not identify this Git host; use a GitHub/GitLab URL and configure its token")
-
-
-def push_github_manifests(api_root, project, branch, directory, publishable, token):
-    api_repo = f"{api_root}/repos/{project}"
-    repository = hosting_api("GET", api_repo, token, "github")
-    default_branch = repository.get("default_branch")
-    if not default_branch:
-        raise RuntimeError(f"repository {project} has no default branch")
-    branch = branch or default_branch
-    ref_endpoint = f"{api_repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
-    try:
-        ref = hosting_api("GET", ref_endpoint, token, "github")
-    except GitRemoteAPIError as error:
-        if error.status != 404:
+        core.read_namespaced_secret(name, ns)
+        return f"secret {ns}/{name} already exists, left unchanged"
+    except ApiException as e:
+        if e.status != 404:
             raise
-        source_ref = hosting_api(
-            "GET", f"{api_repo}/git/ref/heads/{urllib.parse.quote(default_branch, safe='/')}", token, "github")
-        ref = hosting_api("POST", f"{api_root}/repos/{project}/git/refs", token, "github",
-                          {"ref": f"refs/heads/{branch}", "sha": source_ref["object"]["sha"]})
-        print(f"Created branch {branch} from {default_branch}")
-    parent_sha = ref["object"]["sha"]
-    parent = hosting_api("GET", f"{api_repo}/git/commits/{parent_sha}", token, "github")
-    entries = []
-    for filename, content in publishable:
-        blob = hosting_api("POST", f"{api_repo}/git/blobs", token, "github",
-                           {"content": content, "encoding": "utf-8"})
-        path = "/".join(part for part in (directory, filename) if part)
-        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-    tree = hosting_api("POST", f"{api_repo}/git/trees", token, "github",
-                       {"base_tree": parent["tree"]["sha"], "tree": entries})
-    commit = hosting_api("POST", f"{api_repo}/git/commits", token, "github",
-                         {"message": "Add Kubernetes manifests from k8s-ai-agent",
-                          "tree": tree["sha"], "parents": [parent_sha]})
-    hosting_api("PATCH", f"{api_repo}/git/refs/heads/{urllib.parse.quote(branch, safe='/')}",
-                token, "github", {"sha": commit["sha"], "force": False})
-    return branch, commit["sha"]
-
-
-def push_gitlab_manifests(api_root, project, branch, directory, publishable, token):
-    encoded_project = urllib.parse.quote(project, safe="")
-    api_project = f"{api_root}/projects/{encoded_project}"
-    repository = hosting_api("GET", api_project, token, "gitlab")
-    default_branch = repository.get("default_branch")
-    if not default_branch:
-        raise RuntimeError(f"repository {project} has no default branch")
-    branch = branch or default_branch
-    branch_path = urllib.parse.quote(branch, safe="")
-    try:
-        hosting_api("GET", f"{api_project}/repository/branches/{branch_path}", token, "gitlab")
-    except GitRemoteAPIError as error:
-        if error.status != 404:
-            raise
-        query = urllib.parse.urlencode({"branch": branch, "ref": default_branch})
-        hosting_api("POST", f"{api_project}/repository/branches?{query}", token, "gitlab")
-        print(f"Created branch {branch} from {default_branch}")
-
-    actions = []
-    for filename, content in publishable:
-        path = "/".join(part for part in (directory, filename) if part)
-        query = urllib.parse.urlencode({"ref": branch})
-        try:
-            hosting_api("GET", f"{api_project}/repository/files/{urllib.parse.quote(path, safe='')}?{query}",
-                        token, "gitlab")
-            action = "update"
-        except GitRemoteAPIError as error:
-            if error.status != 404:
-                raise
-            action = "create"
-        actions.append({"action": action, "file_path": path, "content": content})
-    commit = hosting_api("POST", f"{api_project}/repository/commits", token, "gitlab",
-                         {"branch": branch, "commit_message": "Add Kubernetes manifests from k8s-ai-agent",
-                          "actions": actions})
-    return branch, commit["id"]
-
-
-def push_task_manifests(repo, branch, directory="manifests", provider_hint=""):
-    provider, origin, project, url_branch = parse_repository_target(repo)
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", project):
-        raise ValueError("repository project path contains unsupported characters")
-    branch = branch or url_branch
-    if branch and (not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith("-")):
-        raise ValueError("invalid branch name")
-    directory = "" if directory.strip() in ("", ".") else directory.strip("/")
-    if directory and not re.fullmatch(r"[A-Za-z0-9._/-]+", directory):
-        raise ValueError("destination directory contains unsupported characters")
-    if not TASK_MANIFESTS:
-        raise RuntimeError("no manifest files were written, read, or applied during this task")
-
-    if provider_hint:
-        provider_hint = provider_hint.strip().lower()
-        if provider_hint not in ("github", "gitlab"):
-            raise ValueError("provider_hint must be github or gitlab")
-        if provider and provider != provider_hint:
-            raise ValueError(f"repository URL identifies {provider}, but LLM target says {provider_hint}")
-        provider = provider_hint
-    else:
-        provider = detect_git_provider(provider, origin or "")
-    if provider == "github":
-        token = os.environ.get("GITHUB_TOKEN", "")
-        if not token:
-            raise RuntimeError("GITHUB_TOKEN is not set in the agent credentials Secret")
-        api_root = "https://api.github.com" if origin == "https://github.com" else f"{origin}/api/v3"
-    else:
-        token = os.environ.get("GITLAB_TOKEN", "")
-        if not token:
-            raise RuntimeError("GITLAB_TOKEN is not set in the agent credentials Secret")
-        api_root = f"{origin}/api/v4"
-
-    publishable = []
-    for filename in sorted(TASK_MANIFESTS):
-        content = manifest_path(filename).read_text()
-        published_content = mask_secret_manifest_for_publish(content)
-        publishable.append((filename, published_content))
-    if provider == "github":
-        branch, commit_sha = push_github_manifests(api_root, project, branch, directory,
-                                                   publishable, token)
-    else:
-        branch, commit_sha = push_gitlab_manifests(api_root, project, branch, directory,
-                                                   publishable, token)
-    remote = f"{origin}/{project}" if origin else project
-    return f"Pushed {len(publishable)} manifest(s) to {remote}@{branch} ({commit_sha[:7]})"
-
-
-def set_publish_target(git_provider, repository, branch=""):
-    provider = str(git_provider).strip().lower()
-    repository = str(repository).strip()
-    branch = str(branch).strip()
-    if provider not in ("github", "gitlab"):
-        raise ValueError("git_provider must be github or gitlab")
-    if not repository:
-        raise ValueError("repository is required when the task requests publishing")
-    PUBLISH_TARGET.clear()
-    PUBLISH_TARGET.update({"provider": provider, "repository": repository, "branch": branch})
-    return f"publish target recorded: provider={provider}, repository={repository}, branch={branch or '(default)'}"
-
-
-def finish_task(report, task):
-    if not report or not report.lstrip().startswith("TASK STATUS: PASS"):
-        return "Publishing not performed because the task did not pass validation."
-    if not TASK_MANIFESTS:
-        return "Publishing not performed because no task manifests were tracked."
-    print("\nTask validated. Task manifests included: " + ", ".join(sorted(TASK_MANIFESTS)))
-    choice = input("Artifacts: [l] keep in pod, [g] push to GitHub/GitLab, [d] discard: ").strip().lower()
-    if choice in ("", "l", "local"):
-        return f"Artifacts kept in {MANIFEST_DIR}; repository publishing was not performed."
-    elif choice in ("d", "discard"):
-        for filename in TASK_MANIFESTS:
-            manifest_path(filename).unlink(missing_ok=True)
-        return "Task manifests discarded; repository publishing was not performed."
-    elif choice in ("g", "github", "git"):
-        target = dict(PUBLISH_TARGET)
-        repo_default = target.get("repository", "")
-        branch_default = target.get("branch", "")
-        provider_default = target.get("provider", "")
-        try:
-            _, _, _, url_branch = parse_repository_target(repo_default)
-        except ValueError:
-            url_branch = ""
-        branch_default = branch_default or url_branch
-        directory_default = "manifests"
-        while True:
-            repo = input(f"Repository URL or owner/project [{repo_default}]: ").strip() or repo_default
-            branch = input(f"Target branch [default: {branch_default or 'repository default'}]: ").strip() or branch_default
-            directory = input(f"Repository directory [{directory_default}]: ").strip() or directory_default
-            try:
-                return push_task_manifests(repo, branch, directory, provider_hint=provider_default)
-            except Exception as e:
-                print(f"Git publish failed: {type(e).__name__}: {e}")
-                if input("Retry publish? [y/N]: ").strip().lower() != "y":
-                    return "Repository publishing failed or was cancelled; no successful push was confirmed."
-    else:
-        return f"Unrecognized choice; manifests remain in {MANIFEST_DIR} and were not published."
-
-
-def format_final_report(report, artifact_result):
-    lines = report.splitlines()
-    status = next((line.strip() for line in lines
-                   if line.strip().startswith("TASK STATUS:")), "TASK STATUS: FAIL")
-    details = [mask_secret_values(line) for line in lines if line.strip() != status
-               and not re.search(r"\b(committed|commit|pushed|push|published|publish)\b", line, re.IGNORECASE)]
-    return "\n".join([status, *details,
-                      f"Repository publishing: {mask_secret_values(artifact_result)}"])
+    body = client.V1Secret(metadata=client.V1ObjectMeta(name=name),
+                           string_data={k: secrets.token_urlsafe(24) for k in keys})
+    core.create_namespaced_secret(ns, body)
+    return f"created secret {ns}/{name} with keys {keys} (values not shown)"
 
 
 def k8s_delete(kind, api_version, name, namespace=""):
@@ -771,7 +425,7 @@ def k8s_delete(kind, api_version, name, namespace=""):
 
 TOOLS = {f.__name__: f for f in (
     namespace_overview, k8s_get, k8s_events, pod_logs, write_manifest, read_manifest,
-    apply_manifest, wait_until_ready, pod_exec, set_publish_target, k8s_delete)}
+    apply_manifest, wait_until_ready, pod_exec, generate_secret, k8s_delete)}
 
 
 # --------------------------------------------------------------------------
@@ -848,10 +502,7 @@ TOOL_SPECS = [
     tool("pod_logs", "Pod container logs (previous=true after a crash).",
          {"pod": S, "container": S, "namespace": NSP, "previous": {"type": "boolean"}, "tail": INT}, ["pod"]),
     tool("write_manifest", "Save YAML (may hold several --- documents) to ~/manifest/<filename>, e.g. 20-statefulset.yaml. "
-            "Follow the user's requested configuration. For Secret integration, support env.valueFrom.secretKeyRef "
-            "or envFrom.secretRef as requested; Secret files stay unchanged locally, while Git publishing masks "
-            "Secret values with same-length stars.",
-         {"filename": S, "content": S}, ["filename", "content"]),
+         "No secret values.", {"filename": S, "content": S}, ["filename", "content"]),
     tool("read_manifest", "Read a saved manifest file.", {"filename": S}, ["filename"]),
     tool("apply_manifest", "Server-side apply a saved manifest file to the cluster.", {"filename": S}, ["filename"]),
     tool("wait_until_ready", "Wait for a StatefulSet/Deployment/Pod/Job to be ready; returns PROBLEM early if pods are stuck.",
@@ -859,10 +510,8 @@ TOOL_SPECS = [
          ["kind", "api_version", "name"]),
     tool("pod_exec", "Run a command (argv list, no shell) in one pod or in several (pods list). Returns exit code and output.",
          {"command": LIST, "pod": S, "pods": LIST, "namespace": NSP, "container": S}, ["command"]),
-        tool("set_publish_target", "For a task requesting Git publishing, interpret its intent and record the Git provider, "
-                 "repository URL or namespace/project, and target branch. Call this once before the final report.",
-                 {"git_provider": {"type": "string", "enum": ["github", "gitlab"]},
-                    "repository": S, "branch": S}, ["git_provider", "repository"]),
+    tool("generate_secret", "Create a Secret with random values for the keys, if missing. Use via secretKeyRef.",
+         {"name": S, "keys": LIST, "namespace": NSP}, ["name", "keys"]),
     tool("k8s_delete", "Delete one namespaced object (needs user approval).",
          {"kind": KIND, "api_version": APIV, "name": S, "namespace": NSP}, ["kind", "api_version", "name"]),
 ]
@@ -874,14 +523,7 @@ Workflow:
 2. If the namespace does not exist, create it. write_manifest (one file per component, numbered:
    00-namespace.yaml, 10-..., 30-...), then apply_manifest. Do not ask the user for permission to do what the
    task asks: the user approves every change at a prompt anyway.
-    Follow the user's requested configuration; do not impose a fixed Secret integration pattern. When the user
-    requests Secret-backed environment variables, support either env.valueFrom.secretKeyRef or envFrom.secretRef
-    exactly as requested. If credentials are required but the user has not specified how to supply them, ask
-    whether to use literal environment values, env.valueFrom.secretKeyRef, envFrom.secretRef, or another source.
-    For every StatefulSet, create and apply the Service named by spec.serviceName before applying the StatefulSet.
-    Include the Service manifest in task artifacts. Apply Secret manifests before workloads that reference them.
-    Secret values in manifests are present in local files and model tool history; Git publishing replaces
-    Secret values with same-length stars in the repository copy only.
+   Passwords: generate_secret + secretKeyRef; never put secret values in manifests.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).
@@ -890,14 +532,7 @@ Workflow:
 4. Verify with evidence (namespace_overview, pod_exec with pods=[...]). Put independent tool calls in one turn.
 5. If requirements are unclear or a prerequisite is missing, ask the user in plain text.
 6. If the user denies an action, do not retry; explain what you need.
-7. Final report, short: begin with exactly `TASK STATUS: PASS` only when all requested changes and
-    validations succeeded; otherwise begin with `TASK STATUS: FAIL`. Include files actually written, checks
-    with evidence, and caveats. Never claim files were pushed, published, or committed. Repository publishing
-    happens only after this report, when the user chooses it at the artifact prompt; actual results are reported
-    by the publisher.
-8. If the task requests committing/pushing/publishing artifacts to Git, use set_publish_target to interpret
-   the provider (GitHub or GitLab), repository, and branch from the user's request. Do not expect Python to
-   infer these details from natural-language task text.
+7. Final report, short: files written, PASS/FAIL per check with evidence, caveats.
 Be concise between tool calls."""
 
 
@@ -1045,10 +680,10 @@ def run_agent(messages):
             resp = llm_call(messages)
         except LimitReached as e:
             print(f"\nStopped: {e}")
-            return None
+            return
         except Exception as e:
             print(f"\nLLM error: {type(e).__name__}: {str(e)[:400]}")
-            return None
+            return
 
         msg = resp.choices[0].message
         entry = {"role": "assistant", "content": msg.content or ""}
@@ -1058,11 +693,11 @@ def run_agent(messages):
                                                  "arguments": tc.function.arguments or "{}"}}
                                    for tc in msg.tool_calls]
         messages.append(entry)
-        if msg.content and msg.tool_calls:
-            print(f"\nAgent: {mask_secret_values(msg.content)}")
+        if msg.content:
+            print(f"\nAgent: {msg.content}")
         if not msg.tool_calls:
             print(f"\n(session total: {STATS['calls']} calls, {STATS['tokens']} tokens)")
-            return msg.content or ""
+            return
 
         for tc in msg.tool_calls:
             try:
@@ -1071,16 +706,10 @@ def run_agent(messages):
                 out = run_tool(tc.function.name, args)
             except json.JSONDecodeError:
                 args, out = {}, "Error: arguments were not valid JSON"
-            display_args = dict(args)
-            if isinstance(display_args.get("content"), str):
-                display_args["content"] = mask_manifest_for_display(display_args["content"])
-            shown = {k: (v if len(str(v)) < 70 else str(v)[:67] + "...")
-                     for k, v in display_args.items()}
-            displayed_out = mask_secret_values(out)
-            print(f"  [tool] {tc.function.name}({shown}) -> {displayed_out[:160].replace(chr(10), ' ')}")
+            shown = {k: (v if len(str(v)) < 70 else str(v)[:67] + "...") for k, v in args.items()}
+            print(f"  [tool] {tc.function.name}({shown}) -> {out[:160].replace(chr(10), ' ')}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
     print("Stopped: step limit reached.")
-    return None
 
 
 def read_task():
@@ -1117,23 +746,19 @@ def main():
 
     key = os.environ.get("GROQ_API_KEY") or getpass.getpass("Groq API key: ").strip()
     llm = Groq(api_key=key)
-    MODEL = os.environ.get("GROQ_MODEL") or pick_model()
+    MODEL = pick_model()
 
     try:
-        config.load_incluster_config()
-        chosen = "in-cluster"
-    except config.ConfigException:
-        try:
-            contexts, active = config.list_kube_config_contexts()   # reads ~/.kube/config
-        except config.ConfigException as e:
-            sys.exit(f"Cannot read kubeconfig: {e}")
-        names = [c["name"] for c in contexts]
-        current = active["name"] if active else names[0]
-        print(f"Kube contexts: {', '.join(names)}  (current: {current})")
-        chosen = input("Context to use [Enter = current]: ").strip() or current
-        if chosen not in names:
-            sys.exit(f"Unknown context '{chosen}'")
-        config.load_kube_config(context=chosen)
+        contexts, active = config.list_kube_config_contexts()   # reads ~/.kube/config
+    except config.ConfigException as e:
+        sys.exit(f"Cannot read kubeconfig: {e}")
+    names = [c["name"] for c in contexts]
+    current = active["name"] if active else names[0]
+    print(f"Kube contexts: {', '.join(names)}  (current: {current})")
+    chosen = input("Context to use [Enter = current]: ").strip() or current
+    if chosen not in names:
+        sys.exit(f"Unknown context '{chosen}'")
+    config.load_kube_config(context=chosen)
     core = client.CoreV1Api()
     dyn = dynamic.DynamicClient(client.ApiClient())
     print(f"Using model {MODEL} | cluster context {chosen} | manifests dir {MANIFEST_DIR}")
@@ -1145,12 +770,7 @@ def main():
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": task}]
-    TASK_MANIFESTS.clear()
-    PUBLISH_TARGET.clear()
-    report = run_agent(messages)
-    artifact_result = finish_task(report, task)
-    if report:
-        print(f"\nAgent: {format_final_report(report, artifact_result)}")
+    run_agent(messages)
 
     while True:                                              # follow-up chat, same memory
         follow = input("\nYou (or 'exit'): ").strip()
@@ -1163,12 +783,7 @@ def main():
             print(f"Switched to model {MODEL}. Type 'continue' to resume.")
             continue
         messages.append({"role": "user", "content": follow})
-        TASK_MANIFESTS.clear()
-        PUBLISH_TARGET.clear()
-        report = run_agent(messages)
-        artifact_result = finish_task(report, follow)
-        if report:
-            print(f"\nAgent: {format_final_report(report, artifact_result)}")
+        run_agent(messages)
 
 
 if __name__ == "__main__":

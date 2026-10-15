@@ -1,8 +1,10 @@
 .git
-.venv
-venv
-__pycache__
-*.py[cod]
-manifest
-k8s
+.gitignore
+venv/
+.venv/
+__pycache__/
+*.pyc
+manifest/
+.env
 README.md
+docker-compose.yaml

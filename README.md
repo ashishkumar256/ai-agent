@@ -4,9 +4,9 @@ A small, generic Kubernetes operations agent. You describe a task in plain Engli
 [Groq](https://groq.com)) plans the work, writes manifests to disk, applies them to your cluster, waits,
 diagnoses failures, fixes them, and validates the result.
 
-- The [Dockerfile](Dockerfile) builds the agent runtime image
-- The [Helm chart](charts/k8s-ai-agent/) deploys and configures the Kubernetes resources
-- Talks to the cluster through the official `kubernetes` Python client
+- One file: `k8s_agent.py` (plus an optional Docker setup: `Dockerfile`, `docker-compose.yaml`)
+- No command-line arguments: everything is asked through prompts
+- Talks to the cluster through the official `kubernetes` Python client (no `kubectl`, no `subprocess`)
 - Every change needs your approval
 - Also in this README: a [free LLM API tiers reference sheet](#free-llm-api-tiers-reference-sheet) (as of 14 October 2026)
 
@@ -28,94 +28,71 @@ end up with the final working YAML on disk.
 
 ## Requirements
 
-- Docker, Helm 3, and `kubectl`
+- Python 3.9+
+- A working kubeconfig (`~/.kube/config`, or the path in `$KUBECONFIG`)
 - A Groq API key (https://console.groq.com/keys) with access to a tool-calling model
   (for example `openai/gpt-oss-120b`)
-- A GitHub or GitLab token with repository write access if tasks should publish manifests
 - Cluster permissions for whatever your task needs (RBAC applies as usual)
 
-## Build and deploy with Docker and Helm
-
-The [Dockerfile](Dockerfile) installs the Python dependencies and packages `k8s_agent.py` into the runtime
-image. Build and publish the image to a registry your cluster can pull from:
+## Install
 
 ```bash
-docker build -t ghcr.io/YOUR_ORG/k8s-ai-agent:latest .
-docker push ghcr.io/YOUR_ORG/k8s-ai-agent:latest
+python -m venv venv
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install -r requirements.txt     # or: pip install groq "kubernetes>=29" pyyaml
+export GROQ_API_KEY="your-key"      # optional: the script asks if it is not set
 ```
 
-The chart creates a credentials Secret when a credential is supplied. The Groq key is required by the
-agent; GitHub and GitLab tokens are optional and are only needed to publish manifests to those hosts. Enter the keys as plain text,
-without base64 encoding, and without echoing them. The chart applies Helm's `b64enc` to populate Kubernetes
-Secret `data`; then install the chart, which creates the namespace and chart resources:
+## Run with Docker
+
+Optional. Needs Docker with the Compose plugin. The container runs as a non-root user, reads your kubeconfig
+read-only, and writes manifests to `./manifest` on your machine.
 
 ```bash
-read -r -s -p "Groq API key: " GROQ_API_KEY
-echo
-read -r -s -p "GitHub token (optional; press Enter to skip): " GITHUB_TOKEN
-echo
-read -r -s -p "GitLab token (optional; press Enter to skip): " GITLAB_TOKEN
-echo
-helm upgrade --install k8s-ai-agent ./charts/k8s-ai-agent \
-  --namespace k8s-ai-agent \
-  --create-namespace \
-  --set image.repository=ghcr.io/YOUR_ORG/k8s-ai-agent \
-  --set image.tag=latest \
-  --set-string credentials.groqApiKey="$GROQ_API_KEY" \
-  --set-string credentials.githubToken="$GITHUB_TOKEN" \
-  --set-string credentials.gitlabToken="$GITLAB_TOKEN"
-unset GROQ_API_KEY GITHUB_TOKEN GITLAB_TOKEN
-
-kubectl -n k8s-ai-agent attach -it $(kubectl -n k8s-ai-agent get pod -l app.kubernetes.io/instance=k8s-ai-agent -o name | head -n 1)
+cp .env.example .env                # optional: set GROQ_API_KEY, KUBE_DIR, AGENT_UID/AGENT_GID
+mkdir -p manifest                   # create it as yourself so the folder is not owned by root
+docker compose build
+docker compose run --rm k8s-agent
 ```
 
-The chart creates the Namespace (through `--create-namespace`), Deployment, ServiceAccount, ClusterRole,
-and ClusterRoleBinding. When either credential is non-empty, it creates a Secret with only the supplied
-key or keys and references it from the Deployment. If all are empty, the Deployment references the
-existing Secret named by `existingCredentialsSecret` (default `agent-credentials`). Helm stores supplied
-credential values in release metadata, so restrict access to the Helm release and use a cluster secret
-manager for production.
+Use `docker compose run`, not `docker compose up`: the agent asks questions and approvals on stdin, and `run`
+attaches your terminal. The prompts and `/end` work exactly as described below.
 
-Common chart settings can be overridden with `--set` or a values file:
-
-| Setting | Default | Purpose |
+| Setting (`.env`) | Default | Meaning |
 |---|---|---|
-| `image.repository` | `k8s-ai-agent` | Container image repository |
-| `image.tag` | `latest` | Container image tag |
-| `groq.model` | `openai/gpt-oss-120b` | Groq chat model |
-| `replicaCount` | `1` | Number of agent pods |
-| `credentials.groqApiKey` | `""` | Groq key; a non-empty value causes chart-managed Secret creation |
-| `credentials.githubToken` | `""` | Optional GitHub token for GitHub.com or GitHub Enterprise |
-| `credentials.gitlabToken` | `""` | Optional GitLab token for GitLab.com or self-managed GitLab |
-| `existingCredentialsSecret` | `agent-credentials` | Secret referenced only when both credential values are empty |
-| `rbac.create` | `true` | Create the chart's ClusterRole and ClusterRoleBinding |
-| `serviceAccount.create` | `true` | Create the ServiceAccount used by the agent |
+| `GROQ_API_KEY` | empty | Empty means the agent asks for it (hidden input) |
+| `KUBE_DIR` | `$HOME/.kube` | Folder holding your kubeconfig, mounted read-only |
+| `KUBECONFIG_NAME` | `config` | Kubeconfig file name inside `KUBE_DIR` |
+| `AGENT_UID` / `AGENT_GID` | `1000` | Match `id -u` / `id -g` on Linux so `./manifest` files belong to you (rebuild after changing) |
 
-Enter the task at the prompt. The pod uses its ServiceAccount token through the Kubernetes in-cluster
-configuration; it does not need a mounted kubeconfig. It remains interactive because approvals and the
-task are entered in the terminal. Detaching does not stop the process; reconnect with the attach command.
-The generated manifests live in the pod's temporary `emptyDir` and are lost if the pod is replaced.
-The artifact list includes manifests written, read, or applied during the current task; unrelated files left
-from earlier tasks are not included automatically. After a task reports `TASK STATUS: PASS`, choose whether to keep its generated manifests in the pod,
-discard them, or push them to GitHub/GitLab. Include `repository: URL` and `branch: branch-name` in the task
-when requesting a push. Give the full GitHub/GitLab repository URL in the task; custom GitHub Enterprise and
-self-managed GitLab URLs are supported. The LLM interprets the task and records the provider, repository, and
-branch for the publish prompt; Python validates that target and performs the API operations. Publishing creates
-one commit containing only manifests included in
-that task, under `manifests/` in the target repository; use `.` at the publish prompt to put them at the
-repository root. If the requested branch does not exist, the agent creates it from the repository's default
-branch. Non-Secret manifests are committed exactly as saved. Secret `stringData` values are replaced in the
-Git publish copy with the same number of `*` characters; Secret `data` values are replaced by base64-encoded
-stars matching the decoded secret length. The pod-local Secret manifest remains unchanged. The GitHub or GitLab
-token is used only for publishing and is never included in the commit.
+**Reaching the cluster from inside the container**
 
-The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
-plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
-workload CRUD, pod logs and exec, and Secret get/create/patch for server-side apply. The agent still asks before using each namespace.
-It cannot manage arbitrary resource kinds or CRDs unless their permissions are added to the chart's RBAC
-template. The agent can execute commands in pods and read or modify Secrets, so treat its credentials and workload
-like privileged automation. Kubernetes RBAC cannot enforce the Python approval prompts. Installing the
-chart requires permission to create ClusterRoles and ClusterRoleBindings.
+- Cluster API on a remote host or cloud (EKS, GKE, AKS with a static token or certificate): works as is.
+- Kubeconfig server is `127.0.0.1` / `localhost` (kind, minikube, k3s, Docker Desktop on this machine):
+  on Linux uncomment `network_mode: host` in `docker-compose.yaml` (and remove `extra_hosts`); on Docker Desktop
+  edit the server to `https://host.docker.internal:<port>` in a copy of the kubeconfig (the certificate may need
+  `insecure-skip-tls-verify` or a matching SAN); for kind use `kind get kubeconfig --internal` with the
+  container attached to the `kind` Docker network.
+- Kubeconfig uses an exec plugin (`aws`, `gcloud`, `az`, `kubelogin`) or certificate paths outside `~/.kube`
+  (minikube keeps them in `~/.minikube`): those binaries and files do not exist in the image. Use a kubeconfig with
+  an embedded token or certificate data for the container, or run the agent directly with Python instead.
+
+## Run
+
+```bash
+python k8s_agent.py
+```
+
+You are asked, in order:
+
+1. **Groq API key**, only if `GROQ_API_KEY` is not set (input is hidden)
+2. **Model**: the script lists the models your key can use and proposes a default; press Enter to accept
+3. **Kube context**: press Enter for the current one
+4. **Task**: type or paste it (include the namespace), then put `/end` on its own line
+5. **Approvals** as the agent works (see [Safety model](#safety-model))
+
+After the first report you can keep giving instructions in the same session. Type `exit` to quit.
+`/model <name>` switches model without losing the session; follow it with `continue`.
 
 ## Example task: highly available PostgreSQL 16
 
@@ -125,9 +102,8 @@ Paste this at the `Task>` prompt, then `/end`:
 Provision and validate a highly available 3-replica PostgreSQL 16 StatefulSet in namespace `middleware`
 with 20Gi storage per replica, using the default StorageClass (do not set storageClassName).
 Use the official postgres:16 image. HA means real streaming replication: postgres-0 is the primary,
-postgres-1 and postgres-2 are standbys built with pg_basebackup. Write `secrets.yaml` as a Secret manifest
-with the password in stringData and apply it first. Ask whether I prefer per-key `env.valueFrom.secretKeyRef`
-or `envFrom.secretRef` before wiring the StatefulSet. Add a headless Service and a postgres-primary Service.
+postgres-1 and postgres-2 are standbys built with pg_basebackup. Passwords come from a Secret created
+with the generate_secret tool. Add a headless Service and a postgres-primary Service.
 Validate: 3/3 pods Ready, PVCs Bound at 20Gi on the default class, server version 16,
 postgres-0 not in recovery with 2 streaming replicas, standbys in recovery, replication lag near zero.
 ```
@@ -147,11 +123,12 @@ want (for example, three independent databases instead of real replication).
 | `k8s_get` | Get or list any kind (including CRDs); `path` returns only part of an object | no |
 | `k8s_events` | Recent events for a namespace or object | no |
 | `pod_logs` | Container logs, including previous crashed container | no |
-| `write_manifest` | Save YAML to `~/manifest/<file>`; Secret values are stored locally and committed unchanged on publish | no |
+| `write_manifest` | Save YAML to `~/manifest/<file>` | no |
 | `read_manifest` | Read a saved manifest | no |
 | `apply_manifest` | Server-side apply of a saved manifest file | **yes** (`a` = always this run) |
 | `wait_until_ready` | Wait for StatefulSet/Deployment/Pod/Job; returns early with evidence if pods are stuck | no |
 | `pod_exec` | Run a command (argv list, no shell) in one or several pods | **yes** (`a` = always this run) |
+| `generate_secret` | Create a Secret with random values; values are never shown to the model | **yes** (`a` = always this run) |
 | `k8s_delete` | Delete one namespaced object | **yes, every time** |
 
 `wait_until_ready` polls inside Python (no LLM calls) and recognizes `ImagePullBackOff`, `ErrImagePull`,
@@ -161,20 +138,12 @@ want (for example, three independent databases instead of real replication).
 
 - **Namespaces are approved on first use.** The first time the agent touches a namespace you get
   `Allow the agent to use namespace 'x'? [y/N]`. Applying a `Namespace` manifest that you approved counts too.
-- **Every change asks first**: apply, exec, delete. Secret creation uses the normal `apply_manifest` approval.
+- **Every change asks first**: apply, secret creation, exec, delete. The prompt shows what will happen.
 - **Deletes always ask**, even if you answered `a` for other tools.
 - **Cluster-scoped objects are blocked**, except `Namespace`. Deleting cluster-scoped objects is not possible.
-- **The running agent has no host shell or kubectl.** The operator uses `kubectl` to install the Helm
-  chart, create the credentials Secret, and attach to the pod; the agent itself talks to Kubernetes via
-  the Python client and only writes task manifests into its `~/manifest` directory.
-- **Secret values are exposed in this mode.** Secret YAML is saved locally and its values are included in model
-  tool history. Git publishing masks the repository copy, but local manifests and model history still contain
-  the real value; protect them and never use production credentials for this demo workflow.
-- Console output masks Secret `data` and `stringData` values with same-length stars; this is display-only and does not
-  change the manifest file or model context. On Git publishing, the repository copy is also masked.
-- Credential sourcing follows the task: users can request literal environment values, per-key
-  `env.valueFrom.secretKeyRef`, `envFrom.secretRef`, or another source. When a required credential has no
-  specified source or Secret injection style, the agent asks instead of choosing one.
+- **No shell on your machine and no kubectl.** The only host action is writing YAML files into `~/manifest`.
+- **Secrets stay out of the model.** Passwords are generated locally and referenced with `secretKeyRef`;
+  manifests contain no secret values.
 - **Step limit** (`MAX_STEPS`, default 60) and a retry limit on failures.
 - Stray keystrokes (for example from pasting) are discarded before each approval prompt.
 
@@ -213,17 +182,18 @@ Constants at the top of `k8s_agent.py`:
 | `MAX_TOOL_OUTPUT` | 2500 | Max characters of any tool result sent to the model |
 | `MAX_STEPS` | 60 | Max model calls per task or follow-up |
 
+Environment variables: `GROQ_API_KEY` (optional), `KUBECONFIG` (kubeconfig path), `MANIFEST_DIR` (where manifests are
+written; default `~/manifest`, set to `/manifest` in the Docker image).
+
 ## Files and folders
 
 | Path | Purpose |
 |---|---|
-| `k8s_agent.py` | Agent application source |
-| `charts/k8s-ai-agent/Chart.yaml` | Helm chart metadata |
-| `charts/k8s-ai-agent/values.yaml` | Configurable image, credentials, RBAC, and pod defaults |
-| `charts/k8s-ai-agent/templates/secrets.yaml` | Optional chart-managed credentials Secret |
-| `charts/k8s-ai-agent/templates/rbac.yaml` | ServiceAccount, ClusterRole, and ClusterRoleBinding |
-| `charts/k8s-ai-agent/templates/deployment.yaml` | Agent Deployment, security context, resources, and writable volumes |
-| `~/manifest/` | Task manifests written by the running agent; pod-local in Kubernetes deployments |
+| `k8s_agent.py` | The agent |
+| `requirements.txt` | Python dependencies (used by the Dockerfile; `pip install -r requirements.txt` works too) |
+| `Dockerfile`, `docker-compose.yaml`, `.dockerignore`, `.env.example` | Optional container setup |
+| `~/manifest/` (Docker: `./manifest/`) | Manifests the agent writes (`00-namespace.yaml`, `10-...`, `30-...`); safe to review, edit, and reuse |
+| `~/.kube/config` | Cluster access (read only; in Docker mounted read-only from `KUBE_DIR`) |
 
 ## Troubleshooting
 
@@ -234,12 +204,18 @@ Constants at the top of `k8s_agent.py`:
 | `Groq daily limit reached` | Wait for the reset, use another key, or move to a paid tier |
 | `A single request exceeds your tokens-per-minute limit` | Use a model with a higher limit or shorten the task |
 | Repeated malformed tool calls | Switch model with `/model` |
+| `Cannot read kubeconfig` | Check `~/.kube/config` or set `KUBECONFIG` |
 | `403 Forbidden` | Your kube user lacks RBAC for that action |
-| `server_side_apply` attribute error | Rebuild and push the image, then run `helm upgrade --install` with the same chart settings |
+| `server_side_apply` attribute error | `pip install -U "kubernetes>=29"` |
 | PVC stays `Pending` | No default StorageClass or its provisioner is not working; ask the agent to check |
 | `ImagePullBackOff` | The agent reports it early with the event message. Wrong tag: it fixes it. Nodes cannot reach the registry: fix networking, no manifest change helps |
 | Pod still broken after the agent fixed a StatefulSet | A StatefulSet does not replace a not-ready pod after a spec change; the agent deletes the stuck pod (you approve) so it is recreated |
 | Agent asks which namespace | Put the namespace in the task |
+| Docker: `Cannot read kubeconfig` | Check `KUBE_DIR` and `KUBECONFIG_NAME` in `.env`; the file must be readable by the container user |
+| Docker: connection refused / timeout to `127.0.0.1` | Kubeconfig points at the host; see "Reaching the cluster from inside the container" |
+| Docker: `exec: "aws"/"gcloud" not found` or missing cert file | Exec plugins and files outside `~/.kube` are not in the image; use embedded credentials or run with Python directly |
+| Docker: `Permission denied` writing `/manifest` | Set `AGENT_UID`/`AGENT_GID` to your ids, `docker compose build`, and make sure `./manifest` is owned by you |
+| Docker: prompts hang or input is garbled | Use `docker compose run --rm k8s-agent` in a real terminal, not `up` or a non-TTY shell |
 | Starting over | `kubectl delete namespace <ns>` (removes its PVCs), then run again |
 
 ## Limitations
@@ -272,6 +248,8 @@ other tasks: deploy an app, add an Ingress, debug a CrashLoopBackOff, set up a C
 
 > **Date notice:** treat this sheet as true as of **14 October 2026**, the date its content was created. Free-tier limits change
 > often and trackers sometimes disagree, so confirm every number in the provider's own dashboard before relying on it.
+
+The same data is available as an editable Excel workbook, `free_llm_api_tiers.xlsx`, with the same three tabs.
 
 ### Free LLM APIs
 
