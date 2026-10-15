@@ -103,9 +103,9 @@ The GitHub token is used only for the publish request and is never included in t
 
 The chart's custom ClusterRole grants an explicit allowlist of workload permissions across namespaces,
 plus read-only discovery for namespaces and StorageClasses. It allows namespace create/patch, common
-workload CRUD, pod logs and exec, and Secret creation. The agent still asks before using each namespace.
+workload CRUD, pod logs and exec, and Secret get/create/patch for server-side apply. The agent still asks before using each namespace.
 It cannot manage arbitrary resource kinds or CRDs unless their permissions are added to the chart's RBAC
-template. The agent can execute commands in pods and create Secrets, so treat its credentials and workload
+template. The agent can execute commands in pods and read or modify Secrets, so treat its credentials and workload
 like privileged automation. Kubernetes RBAC cannot enforce the Python approval prompts. Installing the
 chart requires permission to create ClusterRoles and ClusterRoleBindings.
 
