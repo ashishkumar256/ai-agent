@@ -117,8 +117,9 @@ Paste this at the `Task>` prompt, then `/end`:
 Provision and validate a highly available 3-replica PostgreSQL 16 StatefulSet in namespace `middleware`
 with 20Gi storage per replica, using the default StorageClass (do not set storageClassName).
 Use the official postgres:16 image. HA means real streaming replication: postgres-0 is the primary,
-postgres-1 and postgres-2 are standbys built with pg_basebackup. Include a Secret manifest with the
-password in stringData and reference it with secretKeyRef. Add a headless Service and a postgres-primary Service.
+postgres-1 and postgres-2 are standbys built with pg_basebackup. Write `secrets.yaml` as a Secret manifest
+with the password in stringData and apply it first. Ask whether I prefer per-key `env.valueFrom.secretKeyRef`
+or `envFrom.secretRef` before wiring the StatefulSet. Add a headless Service and a postgres-primary Service.
 Validate: 3/3 pods Ready, PVCs Bound at 20Gi on the default class, server version 16,
 postgres-0 not in recovery with 2 streaming replicas, standbys in recovery, replication lag near zero.
 ```
@@ -161,6 +162,9 @@ want (for example, three independent databases instead of real replication).
 - **Secret values are exposed in this mode.** Secret YAML is saved locally and its values are included in model
   tool history. GitHub publishing replaces values with `REPLACE_BEFORE_USE` in an `*.yaml.example` file, but
   protect local manifests and avoid pushing raw Secret YAML outside the agent's publish workflow.
+- Credential sourcing follows the task: users can request literal environment values, per-key
+  `env.valueFrom.secretKeyRef`, `envFrom.secretRef`, or another source. When a required credential has no
+  specified source or Secret injection style, the agent asks instead of choosing one.
 - **Step limit** (`MAX_STEPS`, default 60) and a retry limit on failures.
 - Stray keystrokes (for example from pasting) are discarded before each approval prompt.
 

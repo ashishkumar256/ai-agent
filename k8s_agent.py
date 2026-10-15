@@ -638,7 +638,8 @@ TOOL_SPECS = [
     tool("pod_logs", "Pod container logs (previous=true after a crash).",
          {"pod": S, "container": S, "namespace": NSP, "previous": {"type": "boolean"}, "tail": INT}, ["pod"]),
     tool("write_manifest", "Save YAML (may hold several --- documents) to ~/manifest/<filename>, e.g. 20-statefulset.yaml. "
-         "Secret values are stored in the local manifest; GitHub publishing redacts them.",
+            "Follow the user's requested configuration. For Secret integration, support env.valueFrom.secretKeyRef "
+            "or envFrom.secretRef as requested; Secret values are stored locally and redacted on GitHub publishing.",
          {"filename": S, "content": S}, ["filename", "content"]),
     tool("read_manifest", "Read a saved manifest file.", {"filename": S}, ["filename"]),
     tool("apply_manifest", "Server-side apply a saved manifest file to the cluster.", {"filename": S}, ["filename"]),
@@ -658,8 +659,12 @@ Workflow:
 2. If the namespace does not exist, create it. write_manifest (one file per component, numbered:
    00-namespace.yaml, 10-..., 30-...), then apply_manifest. Do not ask the user for permission to do what the
    task asks: the user approves every change at a prompt anyway.
-    Secrets: write Secret YAML with stringData like any other resource, then apply it with apply_manifest. Secret
-    values are present in local manifests and model tool history; GitHub publishing replaces them with placeholders.
+    Follow the user's requested configuration; do not impose a fixed Secret integration pattern. When the user
+    requests Secret-backed environment variables, support either env.valueFrom.secretKeyRef or envFrom.secretRef
+    exactly as requested. If credentials are required but the user has not specified how to supply them, ask
+    whether to use literal environment values, env.valueFrom.secretKeyRef, envFrom.secretRef, or another source.
+    Apply Secret manifests before workloads that reference them. Secret values in manifests are present in local
+    files and model tool history; GitHub publishing replaces them with placeholders.
 3. Then wait_until_ready. On PROBLEM/TIMEOUT: diagnose (k8s_events, pod_logs, k8s_get with path), fix the same
    file, re-apply. Max 3 fix cycles, then report.
    - A StatefulSet will not replace a not-ready pod after a spec fix: k8s_delete that pod (kind Pod, api_version v1).
