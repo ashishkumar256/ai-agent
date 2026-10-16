@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --no-compile -r requirements.txt \
     && groupadd --system agent \
-    && useradd --system --gid agent --home-dir /home/agent agent \
+    && useradd --system --gid agent --create-home --home-dir /home/agent agent \
     && chown -R agent:agent /home/agent
 
 COPY --chown=agent:agent k8s_agent.py ./
