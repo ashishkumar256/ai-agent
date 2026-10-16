@@ -5,7 +5,9 @@ No kubectl, no subprocess, no command-line arguments.
 Just run:   python k8s_agent.py
 Prompts: Groq key (if GROQ_API_KEY is not set), model, kube context, the task, approvals.
 
-- Cluster access comes from ~/.kube/config (or $KUBECONFIG).
+- Cluster access: inside a pod it uses the pod's ServiceAccount (RBAC decides what it may do, no kubeconfig needed).
+  Outside a pod it falls back to ~/.kube/config (or $KUBECONFIG) and asks which context to use.
+  Force one with K8S_AUTH=incluster or K8S_AUTH=kubeconfig (default: auto).
 - The model writes manifests as files into ~/manifest (or $MANIFEST_DIR), then applies them (server-side apply).
 - Every change (apply, secret, exec, delete) and every new namespace needs your approval.
 - Built for Groq's per-minute limits: reads the rate-limit headers and waits when needed, retries on 429,
@@ -741,13 +743,18 @@ def pick_model():
     return input(f"Groq model [Enter = {default}]: ").strip() or default
 
 
-def main():
-    global core, dyn, llm, MODEL
-
-    key = os.environ.get("GROQ_API_KEY") or getpass.getpass("Groq API key: ").strip()
-    llm = Groq(api_key=key)
-    MODEL = pick_model()
-
+def connect_cluster():
+    """In a pod: ServiceAccount credentials. Otherwise: kubeconfig with a context prompt. Returns a label."""
+    mode = (os.environ.get("K8S_AUTH") or "auto").lower()
+    in_pod = bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
+    if mode == "incluster" or (mode == "auto" and in_pod):
+        try:
+            config.load_incluster_config()
+        except config.ConfigException as e:
+            sys.exit(f"In-cluster config failed (is a ServiceAccount token mounted?): {e}")
+        sa_ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        where = sa_ns.read_text().strip() if sa_ns.exists() else "?"
+        return f"in-cluster ServiceAccount (pod namespace {where})"
     try:
         contexts, active = config.list_kube_config_contexts()   # reads ~/.kube/config
     except config.ConfigException as e:
@@ -759,9 +766,20 @@ def main():
     if chosen not in names:
         sys.exit(f"Unknown context '{chosen}'")
     config.load_kube_config(context=chosen)
+    return f"kubeconfig context {chosen}"
+
+
+def main():
+    global core, dyn, llm, MODEL
+
+    key = os.environ.get("GROQ_API_KEY") or getpass.getpass("Groq API key: ").strip()
+    llm = Groq(api_key=key)
+    MODEL = pick_model()
+
+    cluster = connect_cluster()
     core = client.CoreV1Api()
     dyn = dynamic.DynamicClient(client.ApiClient())
-    print(f"Using model {MODEL} | cluster context {chosen} | manifests dir {MANIFEST_DIR}")
+    print(f"Using model {MODEL} | cluster: {cluster} | manifests dir {MANIFEST_DIR}")
 
     task = read_task()
     flush_stdin()                                            # discard stray Enter keys left from pasting

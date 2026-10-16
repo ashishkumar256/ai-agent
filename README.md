@@ -77,6 +77,34 @@ attaches your terminal. The prompts and `/end` work exactly as described below.
   (minikube keeps them in `~/.minikube`): those binaries and files do not exist in the image. Use a kubeconfig with
   an embedded token or certificate data for the container, or run the agent directly with Python instead.
 
+## Run inside the cluster (ServiceAccount)
+
+When the container runs in a pod, the agent detects it (`KUBERNETES_SERVICE_HOST`) and authenticates with the pod's
+ServiceAccount. No kubeconfig and no context prompt; RBAC on that ServiceAccount is the hard limit on what the agent
+can do. Set `K8S_AUTH=incluster` or `K8S_AUTH=kubeconfig` to force a mode (default `auto`).
+
+The prompts are interactive, so the pod needs `stdin: true` and `tty: true` on the container, and you attach to it:
+
+```bash
+kubectl -n <agent-namespace> attach -it deploy/k8s-agent      # or: kubectl exec -it <pod> -- python k8s_agent.py
+```
+
+Other things to set on the pod: `GROQ_API_KEY` from a Secret (or type it at the prompt), and a writable `/manifest`
+(an `emptyDir`, or a PVC if you want the YAML to survive restarts). The Docker image already runs as non-root.
+
+RBAC the agent's tools need (namespaced Role/ClusterRole as appropriate for the namespaces you approve):
+
+| Tool | Needs |
+|---|---|
+| `namespace_overview`, `k8s_get`, `k8s_events`, `pod_logs`, `wait_until_ready` | `get`, `list` on the resources involved; `pods/log` `get`; `events` `list`; `namespaces` `get` |
+| `apply_manifest` | `create`, `patch` on each kind it applies; `create`, `patch` on `namespaces` (cluster-scoped) if it creates them |
+| `pod_exec` | `pods/exec` `create` |
+| `generate_secret` | `secrets` `get`, `create` |
+| `k8s_delete` | `delete` on the kinds you allow (at least `pods`) |
+
+Discovery (needed for any kind or CRD) is allowed for authenticated users by default. A `403` in the output means the
+ServiceAccount lacks that verb. The agent's own approval prompts still apply on top of RBAC.
+
 ## Run
 
 ```bash
@@ -204,7 +232,9 @@ written; default `~/manifest`, set to `/manifest` in the Docker image).
 | `Groq daily limit reached` | Wait for the reset, use another key, or move to a paid tier |
 | `A single request exceeds your tokens-per-minute limit` | Use a model with a higher limit or shorten the task |
 | Repeated malformed tool calls | Switch model with `/model` |
-| `Cannot read kubeconfig` | Check `~/.kube/config` or set `KUBECONFIG` |
+| `Cannot read kubeconfig` | Check `~/.kube/config` or set `KUBECONFIG` (not used when running in a pod) |
+| In a pod: `403 Forbidden` / `cannot create resource ...` | The pod's ServiceAccount lacks that verb; add it to its Role/ClusterRole |
+| In a pod: prompts hang or `EOF` right away | Container needs `stdin: true` and `tty: true`; use `kubectl attach -it` or `kubectl exec -it` |
 | `403 Forbidden` | Your kube user lacks RBAC for that action |
 | `server_side_apply` attribute error | `pip install -U "kubernetes>=29"` |
 | PVC stays `Pending` | No default StorageClass or its provisioner is not working; ask the agent to check |
