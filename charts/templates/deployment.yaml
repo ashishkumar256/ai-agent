@@ -43,12 +43,12 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           volumeMounts:
-            - name: manifests
-              mountPath: /home/agent/manifest
+            - name: home-dir
+              mountPath: /home/agent
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: manifests
+        - name: home-dir
           emptyDir: {}
         - name: tmp
           emptyDir: {}
