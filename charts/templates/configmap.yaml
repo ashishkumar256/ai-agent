@@ -1,0 +1,12 @@
+{{- if and .Values.groq (values .Values.groq | compact) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "k8s-ai-agent.configMapName" . }}
+  labels:
+    {{- include "k8s-ai-agent.labels" . | nindent 4 }}
+data:
+  {{- with .Values.groq.model }}
+  GROQ_MODEL: {{ . | quote }}
+  {{- end }}
+{{- end }}

@@ -3,10 +3,11 @@
 K8s AI Agent - Groq powered
 Pure Python (kubernetes client + dulwich)
 Supports GitHub / GitLab / Bitbucket tokens
-No subprocess, no git binary needed
+Interactive input via kubectl attach (type /end to finish prompt)
 """
 
 import os
+import sys
 import json
 import time
 import tempfile
@@ -34,13 +35,20 @@ BITBUCKET_TOKEN = os.getenv("BITBUCKET_TOKEN")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable is required")
 
-# Load in-cluster config (when running as Pod)
+# Recommended models (as of Nov 2026)
+# Primary: openai/gpt-oss-120b   (strong, tool-calling)
+# Alternatives:
+#   openai/gpt-oss-20b
+#   qwen/qwen3.8-27b
+#   meta-llama/llama-4-scout-17b-16e-instruct
+MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# Load in-cluster config
 try:
     config.load_incluster_config()
 except config.ConfigException:
-    config.load_kube_config()  # fallback for local testing
+    config.load_kube_config()
 
-# Kubernetes clients
 api_client = client.ApiClient()
 core_v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
@@ -59,7 +67,7 @@ Your responsibilities:
 1. Understand the user's natural language request.
 2. Create ALL required Kubernetes objects in the correct dependency order.
    - Example: Secret → Service → StatefulSet
-   - Example: detect StorageClass before creating StatefulSet with volumeClaimTemplates
+   - Always detect StorageClass before creating StatefulSet with volumeClaimTemplates
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
@@ -72,7 +80,7 @@ Never invent resource names or namespaces that the user did not request.
 """
 
 # -------------------------------------------------
-# Tool Definitions (for Groq)
+# Tool Definitions
 # -------------------------------------------------
 TOOLS = [
     {
@@ -80,11 +88,7 @@ TOOLS = [
         "function": {
             "name": "detect_storage_class",
             "description": "Detect available StorageClasses and return the default or best one",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+            "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
     {
@@ -95,14 +99,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "yaml_content": {
-                        "type": "string",
-                        "description": "Full YAML content (can contain multiple documents separated by ---)"
-                    },
-                    "namespace": {
-                        "type": "string",
-                        "description": "Target namespace (optional, overrides metadata.namespace)"
-                    }
+                    "yaml_content": {"type": "string", "description": "Full YAML content"},
+                    "namespace": {"type": "string", "description": "Target namespace (optional)"}
                 },
                 "required": ["yaml_content"]
             }
@@ -116,7 +114,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "description": "Resource kind (StatefulSet, Deployment, Pod, etc.)"},
+                    "kind": {"type": "string"},
                     "name": {"type": "string"},
                     "namespace": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "default": 300}
@@ -148,9 +146,7 @@ TOOLS = [
             "description": "Generate a secure random password",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "length": {"type": "integer", "default": 32}
-                },
+                "properties": {"length": {"type": "integer", "default": 32}},
                 "required": []
             }
         }
@@ -159,18 +155,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "git_commit_and_push",
-            "description": "Commit files and push to GitHub / GitLab / Bitbucket. Pass the exact repo_url from the user prompt.",
+            "description": "Commit files and push to GitHub/GitLab/Bitbucket. Pass the exact repo_url from the user prompt.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "repo_url": {
-                        "type": "string",
-                        "description": "Full repository URL (https://github.com/... or https://gitlab.com/... or https://bitbucket.org/...)"
-                    },
-                    "branch": {"type": "string", "description": "Target branch"},
+                    "repo_url": {"type": "string"},
+                    "branch": {"type": "string"},
                     "files": {
                         "type": "object",
-                        "description": "Dictionary of filename → file content (YAML)",
+                        "description": "filename → content",
                         "additionalProperties": {"type": "string"}
                     },
                     "commit_message": {"type": "string"}
@@ -189,21 +182,15 @@ def detect_storage_class() -> Dict[str, Any]:
         sc_list = storage_v1.list_storage_class()
         default_sc = None
         all_scs = []
-
         for sc in sc_list.items:
             name = sc.metadata.name
             is_default = (
                 sc.metadata.annotations
                 and sc.metadata.annotations.get("storageclass.kubernetes.io/is-default-class") == "true"
             )
-            all_scs.append({
-                "name": name,
-                "is_default": is_default,
-                "provisioner": sc.provisioner
-            })
+            all_scs.append({"name": name, "is_default": is_default, "provisioner": sc.provisioner})
             if is_default:
                 default_sc = name
-
         return {
             "default_storage_class": default_sc,
             "available_storage_classes": all_scs,
@@ -214,15 +201,12 @@ def detect_storage_class() -> Dict[str, Any]:
 
 
 def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, Any]:
-    """Apply YAML using pure kubernetes Python client."""
     try:
         docs = list(yaml.safe_load_all(yaml_content))
         results = []
-
         for doc in docs:
             if not doc or not isinstance(doc, dict):
                 continue
-
             if namespace:
                 doc.setdefault("metadata", {})["namespace"] = namespace
 
@@ -233,7 +217,7 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
             ns = metadata.get("namespace", "default")
 
             if not kind or not name:
-                results.append({"error": "Missing kind or name in manifest"})
+                results.append({"error": "Missing kind or name"})
                 continue
 
             try:
@@ -242,34 +226,22 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                 return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
 
             try:
-                # Try update first
                 resource.get(name=name, namespace=ns if resource.namespaced else None)
                 resource.patch(
-                    body=doc,
-                    name=name,
+                    body=doc, name=name,
                     namespace=ns if resource.namespaced else None,
                     content_type="application/merge-patch+json"
                 )
                 action = "configured"
             except ApiException as e:
                 if e.status == 404:
-                    resource.create(
-                        body=doc,
-                        namespace=ns if resource.namespaced else None
-                    )
+                    resource.create(body=doc, namespace=ns if resource.namespaced else None)
                     action = "created"
                 else:
                     raise
 
-            results.append({
-                "action": action,
-                "kind": kind,
-                "name": name,
-                "namespace": ns if resource.namespaced else None
-            })
-
+            results.append({"action": action, "kind": kind, "name": name, "namespace": ns if resource.namespaced else None})
         return {"success": True, "results": results}
-
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -277,7 +249,6 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
 def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 300) -> Dict[str, Any]:
     kind_lower = kind.lower()
     start = time.time()
-
     while time.time() - start < timeout_seconds:
         try:
             if kind_lower in ["statefulset", "sts"]:
@@ -286,39 +257,30 @@ def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 
                 desired = obj.spec.replicas or 0
                 if ready == desired and desired > 0:
                     return {"ready": True, "ready_replicas": ready, "desired": desired}
-
             elif kind_lower in ["deployment", "deploy"]:
                 obj = apps_v1.read_namespaced_deployment(name, namespace)
                 ready = obj.status.ready_replicas or 0
                 desired = obj.spec.replicas or 0
                 if ready == desired and desired > 0:
                     return {"ready": True, "ready_replicas": ready, "desired": desired}
-
             elif kind_lower == "pod":
                 obj = core_v1.read_namespaced_pod(name, namespace)
                 if obj.status.phase == "Running":
-                    if obj.status.container_statuses:
-                        if all(c.ready for c in obj.status.container_statuses):
-                            return {"ready": True, "phase": "Running"}
-                    else:
+                    if obj.status.container_statuses and all(c.ready for c in obj.status.container_statuses):
                         return {"ready": True, "phase": "Running"}
-
+                    return {"ready": True, "phase": "Running"}
             else:
                 return {"error": f"Unsupported kind for wait: {kind}"}
-
         except ApiException as e:
             if e.status != 404:
                 return {"error": str(e)}
-
         time.sleep(5)
-
     return {"ready": False, "error": f"Timeout after {timeout_seconds}s"}
 
 
 def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
     try:
         kind_lower = kind.lower()
-
         if kind_lower in ["statefulset", "sts"]:
             obj = apps_v1.read_namespaced_stateful_set(name, namespace)
         elif kind_lower in ["deployment", "deploy"]:
@@ -335,111 +297,64 @@ def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
             resource = dyn_client.resources.get(kind=kind)
             obj = resource.get(name=name, namespace=namespace)
             return {"success": True, "object": obj.to_dict()}
-
-        return {
-            "success": True,
-            "object": api_client.sanitize_for_serialization(obj)
-        }
+        return {"success": True, "object": api_client.sanitize_for_serialization(obj)}
     except ApiException as e:
         return {"success": False, "error": str(e)}
 
 
 def generate_password(length: int = 32) -> Dict[str, Any]:
-    import secrets
-    import string
+    import secrets, string
     alphabet = string.ascii_letters + string.digits
-    password = ''.join(secrets.choice(alphabet) for _ in range(length))
-    return {"password": password}
+    return {"password": ''.join(secrets.choice(alphabet) for _ in range(length))}
 
 
-def git_commit_and_push(
-    repo_url: str,
-    branch: str,
-    files: Dict[str, str],
-    commit_message: str
-) -> Dict[str, Any]:
-    """
-    Pure Python Git using dulwich (no git binary required).
-    Automatically selects the correct token based on the repo_url domain.
-    """
+def git_commit_and_push(repo_url: str, branch: str, files: Dict[str, str], commit_message: str) -> Dict[str, Any]:
     repo_url = repo_url.strip()
     if not repo_url.endswith(".git"):
         repo_url += ".git"
 
-    # Detect provider + inject token
     if "github.com" in repo_url:
-        token = GITHUB_TOKEN
-        provider = "github"
+        token, provider = GITHUB_TOKEN, "github"
         auth_url = repo_url.replace("https://", f"https://x-access-token:{token}@")
     elif "gitlab.com" in repo_url or "gitlab." in repo_url:
-        token = GITLAB_TOKEN
-        provider = "gitlab"
+        token, provider = GITLAB_TOKEN, "gitlab"
         auth_url = repo_url.replace("https://", f"https://oauth2:{token}@")
     elif "bitbucket.org" in repo_url:
-        token = BITBUCKET_TOKEN
-        provider = "bitbucket"
+        token, provider = BITBUCKET_TOKEN, "bitbucket"
         auth_url = repo_url.replace("https://", f"https://x-token-auth:{token}@")
     else:
-        return {"success": False, "error": f"Unsupported Git provider in URL: {repo_url}"}
+        return {"success": False, "error": f"Unsupported Git provider: {repo_url}"}
 
     if not token:
-        return {"success": False, "error": f"{provider.upper()}_TOKEN environment variable is not set"}
+        return {"success": False, "error": f"{provider.upper()}_TOKEN is not set"}
 
     tmpdir = None
     try:
         tmpdir = tempfile.mkdtemp(prefix="ai-agent-git-")
-
-        # Clone
         try:
             porcelain.clone(auth_url, tmpdir, branch=branch.encode())
         except Exception:
-            # Branch does not exist → clone default branch
             porcelain.clone(auth_url, tmpdir)
 
         repo = DulwichRepo(tmpdir)
-
-        # Ensure target branch exists
         branch_ref = f"refs/heads/{branch}".encode()
         try:
             repo.refs[branch_ref]
         except KeyError:
             repo.refs[branch_ref] = repo.head()
-
-        # Point HEAD to the branch
         porcelain.update_head(repo, branch.encode())
 
-        # Write files into working tree
         for filename, content in files.items():
-            file_path = Path(tmpdir) / filename
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(content, encoding="utf-8")
+            path = Path(tmpdir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
 
-        # Stage everything
         porcelain.add(repo.path)
-
-        # Commit
         author = b"K8s AI Agent <ai-agent@k8s.local>"
-        porcelain.commit(
-            repo.path,
-            message=commit_message.encode(),
-            author=author,
-            committer=author
-        )
+        porcelain.commit(repo.path, message=commit_message.encode(), author=author, committer=author)
+        porcelain.push(repo.path, auth_url, branch_ref)
 
-        # Push
-        porcelain.push(
-            repo.path,
-            auth_url,
-            branch_ref
-        )
-
-        return {
-            "success": True,
-            "provider": provider,
-            "branch": branch,
-            "message": "Successfully committed and pushed (dulwich)"
-        }
-
+        return {"success": True, "provider": provider, "branch": branch, "message": "Pushed successfully"}
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
@@ -447,48 +362,40 @@ def git_commit_and_push(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# -------------------------------------------------
-# Tool Router
-# -------------------------------------------------
 def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    if name == "detect_storage_class":
-        return detect_storage_class()
-    elif name == "k8s_apply":
-        return k8s_apply(**args)
-    elif name == "k8s_wait_ready":
-        return k8s_wait_ready(**args)
-    elif name == "k8s_get":
-        return k8s_get(**args)
-    elif name == "generate_password":
-        return generate_password(**args)
-    elif name == "git_commit_and_push":
-        return git_commit_and_push(**args)
-    else:
+    mapping = {
+        "detect_storage_class": detect_storage_class,
+        "k8s_apply": k8s_apply,
+        "k8s_wait_ready": k8s_wait_ready,
+        "k8s_get": k8s_get,
+        "generate_password": generate_password,
+        "git_commit_and_push": git_commit_and_push,
+    }
+    fn = mapping.get(name)
+    if not fn:
         return {"error": f"Unknown tool: {name}"}
+    return fn(**args)
 
 
 # -------------------------------------------------
-# Main Agent Loop
+# Agent Loop
 # -------------------------------------------------
 def run_agent(user_prompt: str) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt}
     ]
+    print(f"\n[Agent] Received prompt ({len(user_prompt)} chars). Starting...\n")
 
-    print(f"\n[Agent] Starting with prompt:\n{user_prompt}\n")
-
-    max_iterations = 25
-    for _ in range(max_iterations):
+    for _ in range(25):
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=MODEL_NAME,
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.1,
             max_tokens=4096
         )
-
         msg = response.choices[0].message
         messages.append(msg)
 
@@ -502,42 +409,61 @@ def run_agent(user_prompt: str) -> str:
                 fn_args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
                 fn_args = {}
-
-            print(f"\n[Tool Call] {fn_name}")
-            print(json.dumps(fn_args, indent=2))
-
+            print(f"\n[Tool] {fn_name}")
+            print(json.dumps(fn_args, indent=2)[:800])
             result = execute_tool(fn_name, fn_args)
-
-            print(f"[Tool Result] {json.dumps(result, indent=2)[:1200]}")
-            print("-" * 60)
-
+            print(f"[Result] {json.dumps(result, indent=2)[:1000]}")
+            print("-" * 50)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "name": fn_name,
                 "content": json.dumps(result)
             })
-
     return "Agent reached maximum iterations."
+
+
+# -------------------------------------------------
+# Interactive input (for kubectl attach)
+# -------------------------------------------------
+def read_prompt_until_end() -> str:
+    print("=" * 60)
+    print("K8s AI Agent ready.")
+    print("Paste / type your prompt below.")
+    print("When finished, type   /end   on a new line and press Enter.")
+    print("=" * 60)
+    sys.stdout.flush()
+
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "/end":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 # -------------------------------------------------
 # Entry point
 # -------------------------------------------------
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1:
+    if not sys.stdin.isatty() and len(sys.argv) == 1:
+        # Running under kubectl attach / pipe
+        prompt = read_prompt_until_end()
+    elif len(sys.argv) > 1:
         prompt = " ".join(sys.argv[1:])
     else:
-        prompt = """
-        Deploy PostgreSQL 16 StatefulSet with 3 replicas in middleware namespace.
-        Store the password in a Secret.
-        Detect StorageClass and configure 20Gi storage.
-        Validate pod health and wait until Ready.
-        Finally commit the generated YAMLs to https://github.com/ashishkumar256/ai-agent in the manifest branch.
-        """
+        prompt = read_prompt_until_end()
 
-    final_answer = run_agent(prompt)
-    print("\n========== FINAL ANSWER ==========")
-    print(final_answer)
+    if not prompt:
+        print("No prompt received. Exiting.")
+        sys.exit(1)
+
+    final = run_agent(prompt)
+    print("\n" + "=" * 60)
+    print("FINAL ANSWER")
+    print("=" * 60)
+    print(final)

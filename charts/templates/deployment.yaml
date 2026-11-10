@@ -24,14 +24,19 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- $credentialsSecret := include "k8s-ai-agent.credentialsSecretName" . }}
-          {{- if $credentialsSecret }}
+          {{- $configMapName := include "k8s-ai-agent.configMapName" . }}
+          {{- if or $credentialsSecret $configMapName }}
           envFrom:
+            {{- if $credentialsSecret }}
             - secretRef:
                 name: {{ $credentialsSecret }}
+            {{- end }}
+            {{- if $configMapName }}
+            - configMapRef:
+                name: {{ $configMapName }}
+            {{- end }}
           {{- end }}
           env:
-            - name: GROQ_MODEL
-              value: {{ .Values.groq.model | quote }}
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
             - name: PYTHONUNBUFFERED

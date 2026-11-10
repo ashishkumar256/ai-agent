@@ -41,3 +41,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- .Values.existingCredentialsSecret | default "" -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "k8s-ai-agent.configMapName" -}}
+{{- if and .Values.groq (values .Values.groq | compact) -}}
+{{- printf "%s-config" (include "k8s-ai-agent.fullname" .) -}}
+{{- else -}}
+{{- .Values.existingConfigMap | default "" -}}
+{{- end -}}
+{{- end -}}
