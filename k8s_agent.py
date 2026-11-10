@@ -16,7 +16,7 @@ import shutil
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-from groq import Groq, RateLimitError
+from groq import BadRequestError, Groq, RateLimitError
 from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
@@ -420,6 +420,22 @@ def run_agent(user_prompt: str) -> str:
                 delay = max(0, delay)
                 print(f"[Rate limit] Retrying in {delay:.2f}s (attempt {retry + 2}/5).")
                 time.sleep(delay)
+            except BadRequestError as error:
+                body = getattr(error, "body", None)
+                error_details = body.get("error", {}) if isinstance(body, dict) else {}
+                if error_details.get("code") != "output_parse_failed" or retry == 4:
+                    raise
+
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response could not be parsed as a valid response. "
+                        "Retry using a valid tool call when an action is needed; otherwise "
+                        "return a concise final answer. Do not claim an action was completed "
+                        "unless you invoked the corresponding tool."
+                    )
+                })
+                print(f"[Response format] Retrying with a format correction (attempt {retry + 2}/5).")
         msg = response.choices[0].message
         messages.append(msg)
 
