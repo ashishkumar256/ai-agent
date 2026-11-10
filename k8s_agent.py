@@ -9,13 +9,14 @@ Interactive input via kubectl attach (type /end to finish prompt)
 import os
 import sys
 import json
+import re
 import time
 import tempfile
 import shutil
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-from groq import Groq
+from groq import Groq, RateLimitError
 from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
@@ -388,14 +389,37 @@ def run_agent(user_prompt: str) -> str:
     print(f"\n[Agent] Received prompt ({len(user_prompt)} chars). Starting...\n")
 
     for _ in range(25):
-        response = groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.1,
-            max_tokens=4096
-        )
+        for retry in range(5):
+            try:
+                response = groq_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.1,
+                    max_tokens=4096
+                )
+                break
+            except RateLimitError as error:
+                if retry == 4:
+                    raise
+
+                delay = None
+                response_headers = getattr(getattr(error, "response", None), "headers", {})
+                retry_after = response_headers.get("retry-after")
+                if retry_after:
+                    try:
+                        delay = float(retry_after.rstrip("s"))
+                    except ValueError:
+                        pass
+
+                if delay is None:
+                    match = re.search(r"Please try again in ([\d.]+)s", str(error), re.IGNORECASE)
+                    delay = float(match.group(1)) if match else min(2 ** retry, 30)
+
+                delay = max(0, delay)
+                print(f"[Rate limit] Retrying in {delay:.2f}s (attempt {retry + 2}/5).")
+                time.sleep(delay)
         msg = response.choices[0].message
         messages.append(msg)
 
