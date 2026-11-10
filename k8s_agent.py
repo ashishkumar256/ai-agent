@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 K8s AI Agent - Groq powered
-Native Python only (no subprocess)
+Pure Python (kubernetes client + dulwich)
 Supports GitHub / GitLab / Bitbucket tokens
+No subprocess, no git binary needed
 """
 
 import os
@@ -10,15 +11,17 @@ import json
 import time
 import tempfile
 import shutil
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from pathlib import Path
 
 from groq import Groq
-from kubernetes import client, config, dynamic, utils
+from kubernetes import client, config, dynamic
 from kubernetes.client.rest import ApiException
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
 import yaml
-from git import Repo, GitCommandError, Actor
+
+from dulwich import porcelain
+from dulwich.repo import Repo as DulwichRepo
 
 # -------------------------------------------------
 # Configuration
@@ -37,7 +40,7 @@ try:
 except config.ConfigException:
     config.load_kube_config()  # fallback for local testing
 
-# Clients
+# Kubernetes clients
 api_client = client.ApiClient()
 core_v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
@@ -56,7 +59,7 @@ Your responsibilities:
 1. Understand the user's natural language request.
 2. Create ALL required Kubernetes objects in the correct dependency order.
    - Example: Secret → Service → StatefulSet
-   - Example: PVC / StorageClass detection before StatefulSet
+   - Example: detect StorageClass before creating StatefulSet with volumeClaimTemplates
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
@@ -69,7 +72,7 @@ Never invent resource names or namespaces that the user did not request.
 """
 
 # -------------------------------------------------
-# Tool Definitions
+# Tool Definitions (for Groq)
 # -------------------------------------------------
 TOOLS = [
     {
@@ -179,7 +182,7 @@ TOOLS = [
 ]
 
 # -------------------------------------------------
-# Tool Implementations (Native Python)
+# Tool Implementations
 # -------------------------------------------------
 def detect_storage_class() -> Dict[str, Any]:
     try:
@@ -211,7 +214,7 @@ def detect_storage_class() -> Dict[str, Any]:
 
 
 def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, Any]:
-    """Apply YAML using pure kubernetes Python client (no kubectl)."""
+    """Apply YAML using pure kubernetes Python client."""
     try:
         docs = list(yaml.safe_load_all(yaml_content))
         results = []
@@ -220,7 +223,6 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
             if not doc or not isinstance(doc, dict):
                 continue
 
-            # Override namespace if provided
             if namespace:
                 doc.setdefault("metadata", {})["namespace"] = namespace
 
@@ -234,18 +236,15 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                 results.append({"error": "Missing kind or name in manifest"})
                 continue
 
-            # Resolve the API resource
             try:
                 resource = dyn_client.resources.get(api_version=api_version, kind=kind)
             except ResourceNotFoundError:
                 return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
 
-            # Try to patch (server-side apply style) or create
             try:
-                # First try to get existing
-                existing = resource.get(name=name, namespace=ns if resource.namespaced else None)
-                # Update
-                response = resource.patch(
+                # Try update first
+                resource.get(name=name, namespace=ns if resource.namespaced else None)
+                resource.patch(
                     body=doc,
                     name=name,
                     namespace=ns if resource.namespaced else None,
@@ -254,8 +253,7 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                 action = "configured"
             except ApiException as e:
                 if e.status == 404:
-                    # Create
-                    response = resource.create(
+                    resource.create(
                         body=doc,
                         namespace=ns if resource.namespaced else None
                     )
@@ -299,10 +297,8 @@ def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 
             elif kind_lower == "pod":
                 obj = core_v1.read_namespaced_pod(name, namespace)
                 if obj.status.phase == "Running":
-                    # Check container readiness
                     if obj.status.container_statuses:
-                        all_ready = all(c.ready for c in obj.status.container_statuses)
-                        if all_ready:
+                        if all(c.ready for c in obj.status.container_statuses):
                             return {"ready": True, "phase": "Running"}
                     else:
                         return {"ready": True, "phase": "Running"}
@@ -336,7 +332,6 @@ def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
         elif kind_lower == "configmap":
             obj = core_v1.read_namespaced_config_map(name, namespace)
         else:
-            # Generic fallback using dynamic client
             resource = dyn_client.resources.get(kind=kind)
             obj = resource.get(name=name, namespace=namespace)
             return {"success": True, "object": obj.to_dict()}
@@ -364,12 +359,14 @@ def git_commit_and_push(
     commit_message: str
 ) -> Dict[str, Any]:
     """
-    Native GitPython implementation.
+    Pure Python Git using dulwich (no git binary required).
     Automatically selects the correct token based on the repo_url domain.
     """
-    repo_url = repo_url.strip().rstrip(".git") + ".git"
+    repo_url = repo_url.strip()
+    if not repo_url.endswith(".git"):
+        repo_url += ".git"
 
-    # Detect provider and choose token
+    # Detect provider + inject token
     if "github.com" in repo_url:
         token = GITHUB_TOKEN
         provider = "github"
@@ -394,34 +391,53 @@ def git_commit_and_push(
 
         # Clone
         try:
-            repo = Repo.clone_from(auth_url, tmpdir, branch=branch)
-        except GitCommandError:
-            # Branch does not exist → clone default branch and create new one
-            repo = Repo.clone_from(auth_url, tmpdir)
-            repo.git.checkout("-b", branch)
+            porcelain.clone(auth_url, tmpdir, branch=branch.encode())
+        except Exception:
+            # Branch does not exist → clone default branch
+            porcelain.clone(auth_url, tmpdir)
 
-        # Write files
+        repo = DulwichRepo(tmpdir)
+
+        # Ensure target branch exists
+        branch_ref = f"refs/heads/{branch}".encode()
+        try:
+            repo.refs[branch_ref]
+        except KeyError:
+            repo.refs[branch_ref] = repo.head()
+
+        # Point HEAD to the branch
+        porcelain.update_head(repo, branch.encode())
+
+        # Write files into working tree
         for filename, content in files.items():
             file_path = Path(tmpdir) / filename
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
 
         # Stage everything
-        repo.git.add(A=True)
+        porcelain.add(repo.path)
 
         # Commit
-        actor = Actor("K8s AI Agent", "ai-agent@k8s.local")
-        repo.index.commit(commit_message, author=actor, committer=actor)
+        author = b"K8s AI Agent <ai-agent@k8s.local>"
+        porcelain.commit(
+            repo.path,
+            message=commit_message.encode(),
+            author=author,
+            committer=author
+        )
 
         # Push
-        origin = repo.remote(name="origin")
-        origin.push(refspec=f"{branch}:{branch}")
+        porcelain.push(
+            repo.path,
+            auth_url,
+            branch_ref
+        )
 
         return {
             "success": True,
             "provider": provider,
             "branch": branch,
-            "message": "Successfully committed and pushed"
+            "message": "Successfully committed and pushed (dulwich)"
         }
 
     except Exception as e:
@@ -463,7 +479,7 @@ def run_agent(user_prompt: str) -> str:
     print(f"\n[Agent] Starting with prompt:\n{user_prompt}\n")
 
     max_iterations = 25
-    for i in range(max_iterations):
+    for _ in range(max_iterations):
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
@@ -487,12 +503,12 @@ def run_agent(user_prompt: str) -> str:
             except json.JSONDecodeError:
                 fn_args = {}
 
-            print(f"[Tool Call] {fn_name}")
+            print(f"\n[Tool Call] {fn_name}")
             print(json.dumps(fn_args, indent=2))
 
             result = execute_tool(fn_name, fn_args)
 
-            print(f"[Tool Result] {json.dumps(result, indent=2)[:1000]}")
+            print(f"[Tool Result] {json.dumps(result, indent=2)[:1200]}")
             print("-" * 60)
 
             messages.append({
