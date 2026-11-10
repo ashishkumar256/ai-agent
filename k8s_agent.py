@@ -118,7 +118,7 @@ TOOLS = [
                     "kind": {"type": "string"},
                     "name": {"type": "string"},
                     "namespace": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "default": 300}
+                    "timeout_seconds": {"type": "integer", "default": 60}
                 },
                 "required": ["kind", "name", "namespace"]
             }
@@ -247,7 +247,7 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
         return {"success": False, "error": str(e)}
 
 
-def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 300) -> Dict[str, Any]:
+def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 60) -> Dict[str, Any]:
     kind_lower = kind.lower()
     start = time.time()
     while time.time() - start < timeout_seconds:
