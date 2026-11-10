@@ -143,6 +143,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "k8s_delete",
+            "description": "Delete one namespaced Kubernetes resource after user confirmation",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "api_version": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "name": {"type": "string"},
+                    "namespace": {"type": "string"}
+                },
+                "required": ["api_version", "kind", "name", "namespace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_password",
             "description": "Generate a secure random password",
             "parameters": {
@@ -303,6 +320,19 @@ def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
+def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[str, Any]:
+    try:
+        resource = dyn_client.resources.get(api_version=api_version, kind=kind)
+        if not resource.namespaced:
+            return {"success": False, "error": "Cluster-scoped resources cannot be deleted"}
+        resource.delete(name=name, namespace=namespace)
+        return {"success": True, "deleted": kind, "name": name, "namespace": namespace}
+    except ApiException as e:
+        return {"success": False, "error": str(e)}
+    except ResourceNotFoundError:
+        return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
+
+
 def generate_password(length: int = 32) -> Dict[str, Any]:
     import secrets, string
     alphabet = string.ascii_letters + string.digits
@@ -369,6 +399,7 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "k8s_apply": k8s_apply,
         "k8s_wait_ready": k8s_wait_ready,
         "k8s_get": k8s_get,
+        "k8s_delete": k8s_delete,
         "generate_password": generate_password,
         "git_commit_and_push": git_commit_and_push,
     }
@@ -376,6 +407,24 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not fn:
         return {"error": f"Unknown tool: {name}"}
     return fn(**args)
+
+
+def confirm_tool_call(name: str, args: Dict[str, Any]) -> bool:
+    if name == "k8s_apply":
+        print("\nManifest preview (YAML):")
+        print(args.get("yaml_content", "<missing yaml_content>"))
+        if args.get("namespace"):
+            print(f"Target namespace override: {args['namespace']}")
+    else:
+        print("\nOperation details:")
+        print(json.dumps(args, indent=2))
+
+    try:
+        answer = input(f"Approve tool action '{name}'? [y/N]: ").strip().lower()
+    except EOFError:
+        print("No interactive input; operation denied.")
+        return False
+    return answer in {"y", "yes"}
 
 
 # -------------------------------------------------
@@ -450,8 +499,10 @@ def run_agent(user_prompt: str) -> str:
             except json.JSONDecodeError:
                 fn_args = {}
             print(f"\n[Tool] {fn_name}")
-            print(json.dumps(fn_args, indent=2)[:800])
-            result = execute_tool(fn_name, fn_args)
+            if confirm_tool_call(fn_name, fn_args):
+                result = execute_tool(fn_name, fn_args)
+            else:
+                result = {"success": False, "cancelled": True, "message": "User did not approve this operation."}
             print(f"[Result] {json.dumps(result, indent=2)[:1000]}")
             print("-" * 50)
             messages.append({
