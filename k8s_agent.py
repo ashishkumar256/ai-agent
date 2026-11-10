@@ -100,7 +100,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "yaml_content": {"type": "string", "description": "Full YAML content"},
-                    "namespace": {"type": "string", "description": "Target namespace (optional)"}
+                    "namespace": {"type": ["string", "null"], "description": "Target namespace (optional)"}
                 },
                 "required": ["yaml_content"]
             }
