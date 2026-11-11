@@ -819,5 +819,33 @@ if __name__ == "__main__":
         print("=" * 60)
         print(final)
 
+        is_requesting_password = bool(
+            re.search(
+                r"(?:provide|enter|type|input).{0,80}password|password.{0,80}(?:provide|enter|type|input)",
+                final,
+                re.IGNORECASE | re.DOTALL
+            )
+        )
+        if is_requesting_password and sys.stdin.isatty():
+            tool_args = {"source": "user_provided"}
+            if confirm_tool_call("prepare_password", tool_args):
+                password_result = prepare_password(**tool_args)
+            else:
+                password_result = {"success": False, "cancelled": True}
+
+            if password_result.get("success"):
+                continuation = (
+                    "The user chose to provide their own password. It was captured and confirmed "
+                    "through hidden local input. Continue the pending task using this opaque "
+                    "placeholder in Secret.stringData: "
+                    f"{password_result['secret_string_data_placeholder']}. "
+                    "Do not ask for or reveal the password, and do not call prepare_password again."
+                )
+                final = run_agent(continuation, conversation)
+                print("\n" + "=" * 60)
+                print("AGENT RESPONSE")
+                print("=" * 60)
+                print(final)
+
         if prompts is not None:
             break
