@@ -73,6 +73,11 @@ Your responsibilities:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
 4. Always wait until resources become Ready.
+    - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
+    - If readiness times out, inspect k8s_events for the affected resource first.
+    - Only if no relevant events are found, inspect k8s_logs for the affected pod(s).
+    - For k8s_logs, set tail_lines to 200; the tool returns only filtered failure-related lines.
+    - Keep troubleshooting evidence concise; do not request full event histories or logs.
 5. When asked to commit, push the generated YAML files to the Git repository mentioned in the prompt.
 6. Prefer clean, production-ready YAML.
 
@@ -118,9 +123,9 @@ TOOLS = [
                     "kind": {"type": "string"},
                     "name": {"type": "string"},
                     "namespace": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "default": 60}
+                    "timeout_seconds": {"type": "integer", "maximum": 60}
                 },
-                "required": ["kind", "name", "namespace"]
+                "required": ["kind", "name", "namespace", "timeout_seconds"]
             }
         }
     },
@@ -137,6 +142,39 @@ TOOLS = [
                     "namespace": {"type": "string"}
                 },
                 "required": ["kind", "name", "namespace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "k8s_events",
+            "description": "Get a compact summary of recent events in a namespace, optionally filtered to a resource",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "namespace": {"type": "string"},
+                    "name": {"type": "string"},
+                    "kind": {"type": "string"}
+                },
+                "required": ["namespace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "k8s_logs",
+            "description": "Scan up to tail_lines (maximum 200) recent pod log lines and return only error/failure/status-code matches; call after checking events",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "namespace": {"type": "string"},
+                    "container": {"type": "string"},
+                    "tail_lines": {"type": "integer", "maximum": 200}
+                },
+                "required": ["name", "namespace", "tail_lines"]
             }
         }
     },
@@ -266,34 +304,56 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
 
 def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 60) -> Dict[str, Any]:
     kind_lower = kind.lower()
+    timeout_seconds = max(1, min(timeout_seconds, 60))
     start = time.time()
-    while time.time() - start < timeout_seconds:
+    while True:
+        remaining = timeout_seconds - (time.time() - start)
+        if remaining <= 0:
+            return {
+                "ready": False,
+                "timed_out": True,
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "timeout_seconds": timeout_seconds,
+                "next_step": "Check k8s_events for this resource; if no relevant events exist, check k8s_logs for its pod."
+            }
         try:
             if kind_lower in ["statefulset", "sts"]:
-                obj = apps_v1.read_namespaced_stateful_set(name, namespace)
+                obj = apps_v1.read_namespaced_stateful_set(name, namespace, _request_timeout=remaining)
                 ready = obj.status.ready_replicas or 0
                 desired = obj.spec.replicas or 0
-                if ready == desired and desired > 0:
+                if ready == desired:
                     return {"ready": True, "ready_replicas": ready, "desired": desired}
             elif kind_lower in ["deployment", "deploy"]:
-                obj = apps_v1.read_namespaced_deployment(name, namespace)
+                obj = apps_v1.read_namespaced_deployment(name, namespace, _request_timeout=remaining)
                 ready = obj.status.ready_replicas or 0
                 desired = obj.spec.replicas or 0
-                if ready == desired and desired > 0:
+                if ready == desired:
                     return {"ready": True, "ready_replicas": ready, "desired": desired}
             elif kind_lower == "pod":
-                obj = core_v1.read_namespaced_pod(name, namespace)
-                if obj.status.phase == "Running":
-                    if obj.status.container_statuses and all(c.ready for c in obj.status.container_statuses):
-                        return {"ready": True, "phase": "Running"}
-                    return {"ready": True, "phase": "Running"}
+                obj = core_v1.read_namespaced_pod(name, namespace, _request_timeout=remaining)
+                statuses = obj.status.container_statuses or []
+                if obj.status.phase == "Running" and statuses and all(container.ready for container in statuses):
+                    return {"ready": True, "phase": "Running", "containers_ready": len(statuses)}
             else:
                 return {"error": f"Unsupported kind for wait: {kind}"}
         except ApiException as e:
             if e.status != 404:
-                return {"error": str(e)}
-        time.sleep(5)
-    return {"ready": False, "error": f"Timeout after {timeout_seconds}s"}
+                return {"ready": False, "error": str(e)[:500]}
+
+        remaining = timeout_seconds - (time.time() - start)
+        if remaining <= 0:
+            return {
+                "ready": False,
+                "timed_out": True,
+                "kind": kind,
+                "name": name,
+                "namespace": namespace,
+                "timeout_seconds": timeout_seconds,
+                "next_step": "Check k8s_events for this resource; if no relevant events exist, check k8s_logs for its pod."
+            }
+        time.sleep(min(5, remaining))
 
 
 def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
@@ -318,6 +378,75 @@ def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
         return {"success": True, "object": api_client.sanitize_for_serialization(obj)}
     except ApiException as e:
         return {"success": False, "error": str(e)}
+
+
+def k8s_events(namespace: str, name: Optional[str] = None, kind: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        selectors = []
+        if name:
+            selectors.append(f"involvedObject.name={name}")
+        if kind:
+            selectors.append(f"involvedObject.kind={kind}")
+        response = core_v1.list_namespaced_event(
+            namespace,
+            field_selector=",".join(selectors) or None,
+            limit=100
+        )
+        items = sorted(
+            response.items,
+            key=lambda event: (
+                event.last_timestamp or event.event_time or event.first_timestamp
+            ).timestamp() if (event.last_timestamp or event.event_time or event.first_timestamp) else 0,
+            reverse=True
+        )
+        compact_events = []
+        for event in items[:5]:
+            compact_events.append({
+                "type": event.type,
+                "reason": event.reason,
+                "object": f"{event.involved_object.kind}/{event.involved_object.name}",
+                "count": event.count,
+                "message": (event.message or "")[:300]
+            })
+        return {"found": bool(compact_events), "count": len(items), "events": compact_events}
+    except ApiException as e:
+        return {"found": False, "error": str(e)[:400]}
+
+
+def k8s_logs(name: str, namespace: str, container: Optional[str] = None, tail_lines: int = 40) -> Dict[str, Any]:
+    try:
+        tail_lines = max(1, min(tail_lines, 200))
+        log_text = core_v1.read_namespaced_pod_log(
+            name,
+            namespace,
+            container=container,
+            tail_lines=tail_lines,
+            timestamps=True
+        )
+        lines = log_text.splitlines()
+        failure_pattern = re.compile(
+            r"error|fatal|panic|crit(?:ical)?|exception|stack[\s_-]*trace|traceback|"
+            r"oomkilled|\bkilled\b|fail(?:ed|ure)?|refused|tim(?:e|ed)[\s_-]*out|unhealthy|"
+            r"missing|not found|permission denied|crashloopbackoff|imagepullbackoff|"
+            r"errimagepull|back-off|connection reset|http\s*/?\s*[45]\d{2}|"
+            r"status(?:\s*code)?\s*[:=]?\s*[45]\d{2}|\b[45]\d{2}\b",
+            re.IGNORECASE
+        )
+        matching_lines = [line[:400] for line in lines if failure_pattern.search(line)]
+        selected_lines = matching_lines[-20:]
+        filtered_logs = "\n".join(selected_lines)[-2500:]
+        return {
+            "pod": name,
+            "namespace": namespace,
+            "container": container,
+            "scanned_lines": len(lines),
+            "matched_lines": len(matching_lines),
+            "returned_lines": len(selected_lines),
+            "logs": filtered_logs,
+            "message": "No failure-related log lines matched." if not matching_lines else None
+        }
+    except ApiException as e:
+        return {"pod": name, "namespace": namespace, "error": str(e)[:400]}
 
 
 def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[str, Any]:
@@ -399,6 +528,8 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "k8s_apply": k8s_apply,
         "k8s_wait_ready": k8s_wait_ready,
         "k8s_get": k8s_get,
+        "k8s_events": k8s_events,
+        "k8s_logs": k8s_logs,
         "k8s_delete": k8s_delete,
         "generate_password": generate_password,
         "git_commit_and_push": git_commit_and_push,
