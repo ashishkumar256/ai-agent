@@ -75,10 +75,10 @@ Your responsibilities:
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
-    - Before handling a credential, ask whether the user wants a generated password or wants to provide one.
-    - Ask the user whether they prefer a generated or user-provided password.
-    - The application handles the choice and password locally, then supplies an opaque placeholder. Never call a password tool or ask the user to type a password in normal chat.
-    - When given a prepared-password placeholder, continue the pending task immediately and use it in Secret.stringData; do not ask for the source or password again.
+    - Before handling a credential, ask in plain language whether the user wants you to generate a password or provide their own.
+    - Interpret the user's natural-language answer from conversation context; do not require internal keywords or hardcoded phrases.
+    - Once the preference is clear, call prepare_password with source="generated" or source="user_provided". The tool handles passwords locally and returns only an opaque placeholder.
+    - After prepare_password returns, continue the pending task and use the placeholder in Secret.stringData. Do not ask for the password or preference again.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
@@ -204,6 +204,21 @@ TOOLS = [
                     "namespace": {"type": "string"}
                 },
                 "required": ["api_version", "kind", "name", "namespace"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "prepare_password",
+            "description": "After interpreting the user's password preference, prepare it locally. Use generated or user_provided; the actual password is never returned, only an opaque Secret stringData placeholder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "enum": ["generated", "user_provided"]},
+                    "length": {"type": "integer", "default": 32}
+                },
+                "required": ["source"]
             }
         }
     },
@@ -634,6 +649,7 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "k8s_events": k8s_events,
         "k8s_logs": k8s_logs,
         "k8s_delete": k8s_delete,
+        "prepare_password": prepare_password,
         "git_commit_and_push": git_commit_and_push,
     }
     fn = mapping.get(name)
@@ -794,33 +810,6 @@ if __name__ == "__main__":
             if prompts is None and not sys.stdin.isatty():
                 break
             continue
-
-        password_source = prompt.strip().lower().replace(" ", "_")
-        if password_source in {"generated", "user_provided"}:
-            tool_args = {"source": password_source}
-            if confirm_tool_call("prepare_password", tool_args):
-                result = prepare_password(**tool_args)
-            else:
-                result = {"success": False, "cancelled": True}
-            if result.get("success"):
-                original_task = next(
-                    (
-                        message.get("content", "")
-                        for message in conversation or []
-                        if isinstance(message, dict) and message.get("role") == "user"
-                    ),
-                    ""
-                )
-                prompt = (
-                    "The user is answering your password-source question for the pending task below. "
-                    f"Original task: {original_task}\n"
-                    f"The user selected {password_source}. The password is already prepared locally; "
-                    f"use this placeholder as the Secret stringData value: "
-                    f"{result['secret_string_data_placeholder']}. Continue the original task now. "
-                    "Do not ask for the password or its source again, and do not call any password tool."
-                )
-            else:
-                prompt = f"Password preparation was not completed: {result.get('error', 'user declined')}"
 
         if conversation is None:
             conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
