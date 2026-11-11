@@ -13,7 +13,6 @@ import re
 import time
 import tempfile
 import shutil
-import getpass
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -75,9 +74,8 @@ Your responsibilities:
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
-    - Call prepare_password when a credential is required. The application asks the user directly whether to generate a password or enter their own; do not choose the source yourself.
-    - The tool handles passwords locally and returns only an opaque placeholder.
-    - After prepare_password returns, continue the pending task and use the placeholder in Secret.stringData. Do not ask for the password or preference again.
+    - Call prepare_password when a credential is required; it generates a strong random password locally.
+    - The tool returns only an opaque placeholder. Use it in Secret.stringData and never ask the user to provide a password.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
@@ -210,7 +208,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "prepare_password",
-            "description": "Ask the user locally whether to generate a password or enter their own, then prepare it. Never return the password; returns only an opaque Secret stringData placeholder.",
+            "description": "Generate a strong random password locally. Never return the password; returns only an opaque Secret stringData placeholder.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -555,42 +553,15 @@ def prepare_password(length: int = 32) -> Dict[str, Any]:
     import secrets
     import string
 
-    if not sys.stdin.isatty():
-        return {"success": False, "error": "Password selection requires an interactive TTY; cancelled."}
-    try:
-        choice = input("Password choice: [Enter/g] generate, [p] provide your own: ").strip().lower()
-    except EOFError:
-        return {"success": False, "error": "No interactive input; password preparation cancelled."}
-
-    if choice in {"", "g", "generate", "generated"}:
-        source = "generated"
-    elif choice in {"p", "provide", "provided", "own", "user_provided"}:
-        source = "user_provided"
-    else:
-        return {"success": False, "error": "Choose generate or provide; password preparation cancelled."}
-
-    if source == "generated":
-        alphabet = string.ascii_letters + string.digits
-        password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
-    elif source == "user_provided":
-        try:
-            password = getpass.getpass("Enter password (input hidden): ")
-            confirmation = getpass.getpass("Confirm password (input hidden): ")
-        except EOFError:
-            return {"success": False, "error": "No interactive input; password creation cancelled."}
-        if not password:
-            return {"success": False, "error": "Password cannot be empty."}
-        if password != confirmation:
-            return {"success": False, "error": "Passwords did not match; retry password entry."}
-    else:
-        return {"success": False, "error": "Password source must be generated or user_provided."}
+    alphabet = string.ascii_letters + string.digits
+    password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
 
     placeholder = f"{PASSWORD_PLACEHOLDER_PREFIX}{secrets.token_hex(8)}__"
     PASSWORD_VALUES[placeholder] = password
     return {
         "success": True,
         "password_ready": True,
-        "source": source,
+        "source": "generated",
         "secret_string_data_placeholder": placeholder,
         "note": "Use this placeholder as the Secret stringData value; the actual password is inserted locally and is not returned."
     }
@@ -854,7 +825,7 @@ if __name__ == "__main__":
             )
         )
         if is_requesting_password and sys.stdin.isatty():
-            tool_args = {"source": "user_provided"}
+            tool_args = {}
             if confirm_tool_call("prepare_password", tool_args):
                 password_result = prepare_password(**tool_args)
             else:
@@ -862,11 +833,10 @@ if __name__ == "__main__":
 
             if password_result.get("success"):
                 continuation = (
-                    "The user chose to provide their own password. It was captured and confirmed "
-                    "through hidden local input. Continue the pending task using this opaque "
-                    "placeholder in Secret.stringData: "
+                    "A strong random password was generated locally. Continue the pending task "
+                    "using this opaque placeholder in Secret.stringData: "
                     f"{password_result['secret_string_data_placeholder']}. "
-                    "Do not ask for or reveal the password, and do not call prepare_password again."
+                    "Do not ask the user to provide a password or reveal the generated value."
                 )
                 final = run_agent(continuation, conversation)
                 print("\n" + "=" * 60)
