@@ -83,14 +83,16 @@ Your responsibilities:
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
-    - If readiness times out, inspect k8s_events for the affected resource first.
-    - Only if no relevant events are found, inspect k8s_logs for the affected pod(s).
+    - Do not call k8s_events or k8s_logs after a successful readiness check.
+    - After a timeout or readiness failure, inspect events only when diagnostic details are needed.
+    - Inspect logs only when events are empty or insufficient to diagnose the failure.
     - For k8s_logs, set tail_lines to 200; the tool returns only filtered failure-related lines.
     - Keep troubleshooting evidence concise; do not request full event histories or logs.
 5. When asked to commit, push the generated YAML files to the Git repository mentioned in the prompt.
 6. Prefer clean, production-ready YAML.
 
 Available tools are provided. Use them step by step.
+Each Kubernetes object in a multi-document apply requires its own separate approval; never group resource approvals.
 Never invent resource names or namespaces that the user did not request.
 When required names are unknown, ask for the namespace, then use k8s_get with name omitted or empty to list existing resources and let the user choose. Never end the interactive session merely because you need clarification; ask a concise follow-up question and wait for the user's next message.
 For password rotation, discover the existing Secret and workload before proposing changes. Do not assume changing a Kubernetes Secret alone changes the password inside a running database; explain and confirm the database password update and any required rollout.
@@ -112,7 +114,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "k8s_apply",
-            "description": "Apply one or more Kubernetes YAML manifests (supports multi-document YAML)",
+            "description": "Apply one or more Kubernetes YAML manifests (supports multi-document YAML); each resource is previewed and requires separate user approval",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -160,7 +162,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "k8s_events",
-            "description": "Get a compact summary of recent events in a namespace, optionally filtered to a resource",
+            "description": "For a failed or timed-out readiness check only, get compact events optionally filtered to a resource; do not call for healthy resources",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -176,7 +178,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "k8s_logs",
-            "description": "Scan up to tail_lines (maximum 200) recent pod log lines and return only error/failure/status-code matches; call after checking events",
+            "description": "Fallback only when events are empty or inconclusive after readiness failure; scan recent pod logs and return only error/failure/status-code matches",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -270,7 +272,7 @@ def detect_storage_class() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, Any]:
+def k8s_apply(yaml_content: str, namespace: Optional[str] = None, approved: bool = False) -> Dict[str, Any]:
     try:
         docs = list(yaml.safe_load_all(yaml_content))
         results = []
@@ -280,6 +282,28 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                 continue
             if namespace:
                 doc.setdefault("metadata", {})["namespace"] = namespace
+
+            kind = doc.get("kind")
+            metadata = doc.get("metadata", {})
+            name = metadata.get("name")
+            resource_namespace = metadata.get("namespace", "default")
+            if not kind or not name:
+                results.append({"success": False, "error": "Missing kind or name"})
+                continue
+
+            if not approved and not confirm_tool_call("k8s_apply", {
+                "yaml_content": yaml.safe_dump(doc, sort_keys=False),
+                "resource": f"{kind}/{name}",
+                "namespace": resource_namespace
+            }):
+                results.append({
+                    "success": False,
+                    "cancelled": True,
+                    "kind": kind,
+                    "name": name,
+                    "namespace": resource_namespace
+                })
+                continue
 
             if doc.get("kind", "").lower() == "secret":
                 string_data = doc.get("stringData")
@@ -292,14 +316,7 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                                     used_password_placeholders.add(placeholder)
 
             api_version = doc.get("apiVersion", "v1")
-            kind = doc.get("kind")
-            metadata = doc.get("metadata", {})
-            name = metadata.get("name")
-            ns = metadata.get("namespace", "default")
-
-            if not kind or not name:
-                results.append({"error": "Missing kind or name"})
-                continue
+            ns = resource_namespace
 
             try:
                 resource = dyn_client.resources.get(api_version=api_version, kind=kind)
@@ -644,16 +661,18 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def confirm_tool_call(name: str, args: Dict[str, Any]) -> bool:
     if name == "k8s_apply":
-        print("\nManifest preview (YAML):")
+        resource = args.get("resource")
+        resource_details = f" for {resource}" if resource else ""
+        print(f"\nManifest preview{resource_details} (YAML):")
         print(args.get("yaml_content", "<missing yaml_content>"))
         if args.get("namespace"):
-            print(f"Target namespace override: {args['namespace']}")
+            print(f"Namespace: {args['namespace']}")
     else:
         print("\nOperation details:")
         print(json.dumps(args, indent=2))
 
     try:
-        answer = input(f"Approve tool action '{name}'? [y/N]: ").strip().lower()
+        answer = input(f"Approve tool action '{name}'{resource_details}? [y/N]: ").strip().lower()
     except EOFError:
         print("No interactive input; operation denied.")
         return False
@@ -735,7 +754,9 @@ def run_agent(user_prompt: str, messages: Optional[list] = None) -> str:
             except json.JSONDecodeError:
                 fn_args = {}
             print(f"\n[Tool] {fn_name}")
-            if confirm_tool_call(fn_name, fn_args):
+            if fn_name == "k8s_apply":
+                result = execute_tool(fn_name, fn_args)
+            elif confirm_tool_call(fn_name, fn_args):
                 result = execute_tool(fn_name, fn_args)
             else:
                 result = {"success": False, "cancelled": True, "message": "User did not approve this operation."}
