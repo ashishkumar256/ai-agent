@@ -75,7 +75,9 @@ Your responsibilities:
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
-    - For credentials, call generate_password and use the returned placeholder as the value in Secret.stringData.
+    - Before handling a credential, ask whether the user wants a generated password or wants to provide one.
+    - Ask the user to choose generated or user_provided before calling prepare_password.
+    - Pass that exact choice as source; use the returned placeholder in Secret.stringData.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
@@ -205,12 +207,15 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_password",
-            "description": "Prompt the user to use a generated or hidden user-provided password; return an opaque placeholder for Secret.stringData, never the password itself",
+            "name": "prepare_password",
+            "description": "Prepare a password only after the user chooses its source: generated or user_provided. Returns an opaque placeholder for Secret.stringData; never returns the password.",
             "parameters": {
                 "type": "object",
-                "properties": {"length": {"type": "integer", "default": 32}},
-                "required": []
+                "properties": {
+                    "source": {"type": "string", "enum": ["generated", "user_provided"]},
+                    "length": {"type": "integer", "default": 32}
+                },
+                "required": ["source"]
             }
         }
     },
@@ -530,21 +535,16 @@ def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[s
         return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
 
 
-def generate_password(length: int = 32) -> Dict[str, Any]:
+def prepare_password(source: str, length: int = 32) -> Dict[str, Any]:
     import secrets
     import string
 
-    if not sys.stdin.isatty():
-        return {"success": False, "error": "Password selection requires an interactive TTY; password creation cancelled."}
-
-    try:
-        choice = input("Use a generated password? [Y/n]: ").strip().lower()
-    except EOFError:
-        return {"success": False, "error": "No interactive input; password creation cancelled."}
-    if choice not in {"", "y", "yes", "n", "no"}:
-        return {"success": False, "error": "Choose yes or no; password creation cancelled."}
-
-    if choice in {"n", "no"}:
+    if source == "generated":
+        alphabet = string.ascii_letters + string.digits
+        password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+    elif source == "user_provided":
+        if not sys.stdin.isatty():
+            return {"success": False, "error": "User-provided password requires an interactive TTY; cancelled."}
         try:
             password = getpass.getpass("Enter password (input hidden): ")
             confirmation = getpass.getpass("Confirm password: ")
@@ -553,17 +553,16 @@ def generate_password(length: int = 32) -> Dict[str, Any]:
         if not password:
             return {"success": False, "error": "Password cannot be empty."}
         if password != confirmation:
-            return {"success": False, "error": "Passwords did not match; retry password creation."}
+            return {"success": False, "error": "Passwords did not match; retry password entry."}
     else:
-        alphabet = string.ascii_letters + string.digits
-        password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+        return {"success": False, "error": "Password source must be generated or user_provided."}
 
     placeholder = f"{PASSWORD_PLACEHOLDER_PREFIX}{secrets.token_hex(8)}__"
     PASSWORD_VALUES[placeholder] = password
     return {
         "success": True,
         "password_ready": True,
-        "source": "user-provided" if choice in {"n", "no"} else "generated",
+        "source": source,
         "secret_string_data_placeholder": placeholder,
         "note": "Use this placeholder as the Secret stringData value; the actual password is inserted locally and is not returned."
     }
@@ -632,7 +631,7 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "k8s_events": k8s_events,
         "k8s_logs": k8s_logs,
         "k8s_delete": k8s_delete,
-        "generate_password": generate_password,
+        "prepare_password": prepare_password,
         "git_commit_and_push": git_commit_and_push,
     }
     fn = mapping.get(name)
