@@ -78,6 +78,8 @@ Your responsibilities:
     - Before handling a credential, ask whether the user wants a generated password or wants to provide one.
     - Ask the user to choose generated or user_provided before calling prepare_password.
     - Pass that exact choice as source; use the returned placeholder in Secret.stringData.
+    - After user_provided is selected, call prepare_password immediately. Never ask the user to type a password in normal chat; prepare_password uses hidden input.
+    - If the latest user message says the password is already prepared and includes a placeholder, use that placeholder directly; do not call prepare_password again.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
@@ -547,7 +549,7 @@ def prepare_password(source: str, length: int = 32) -> Dict[str, Any]:
             return {"success": False, "error": "User-provided password requires an interactive TTY; cancelled."}
         try:
             password = getpass.getpass("Enter password (input hidden): ")
-            confirmation = getpass.getpass("Confirm password: ")
+            confirmation = getpass.getpass("Confirm password (input hidden): ")
         except EOFError:
             return {"success": False, "error": "No interactive input; password creation cancelled."}
         if not password:
@@ -787,6 +789,22 @@ if __name__ == "__main__":
             if prompts is None and not sys.stdin.isatty():
                 break
             continue
+
+        password_source = prompt.strip().lower().replace(" ", "_")
+        if password_source in {"generated", "user_provided"}:
+            tool_args = {"source": password_source}
+            if confirm_tool_call("prepare_password", tool_args):
+                result = prepare_password(**tool_args)
+            else:
+                result = {"success": False, "cancelled": True}
+            if result.get("success"):
+                prompt = (
+                    f"The user selected {password_source} and the password has been prepared securely. "
+                    f"Use this placeholder as the Secret stringData value: "
+                    f"{result['secret_string_data_placeholder']}. Do not request or reveal the password."
+                )
+            else:
+                prompt = f"Password preparation was not completed: {result.get('error', 'user declined')}"
 
         if conversation is None:
             conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
