@@ -75,9 +75,8 @@ Your responsibilities:
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
-    - Before handling a credential, ask in plain language whether the user wants you to generate a password or provide their own.
-    - Interpret the user's natural-language answer from conversation context; do not require internal keywords or hardcoded phrases.
-    - Once the preference is clear, call prepare_password with source="generated" or source="user_provided". The tool handles passwords locally and returns only an opaque placeholder.
+    - Call prepare_password when a credential is required. The application asks the user directly whether to generate a password or enter their own; do not choose the source yourself.
+    - The tool handles passwords locally and returns only an opaque placeholder.
     - After prepare_password returns, continue the pending task and use the placeholder in Secret.stringData. Do not ask for the password or preference again.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
@@ -211,14 +210,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "prepare_password",
-            "description": "After interpreting the user's password preference, prepare it locally. Use generated or user_provided; the actual password is never returned, only an opaque Secret stringData placeholder.",
+            "description": "Ask the user locally whether to generate a password or enter their own, then prepare it. Never return the password; returns only an opaque Secret stringData placeholder.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "enum": ["generated", "user_provided"]},
                     "length": {"type": "integer", "default": 32}
                 },
-                "required": ["source"]
+                "required": []
             }
         }
     },
@@ -553,16 +551,28 @@ def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[s
         return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
 
 
-def prepare_password(source: str, length: int = 32) -> Dict[str, Any]:
+def prepare_password(length: int = 32) -> Dict[str, Any]:
     import secrets
     import string
+
+    if not sys.stdin.isatty():
+        return {"success": False, "error": "Password selection requires an interactive TTY; cancelled."}
+    try:
+        choice = input("Password choice: [Enter/g] generate, [p] provide your own: ").strip().lower()
+    except EOFError:
+        return {"success": False, "error": "No interactive input; password preparation cancelled."}
+
+    if choice in {"", "g", "generate", "generated"}:
+        source = "generated"
+    elif choice in {"p", "provide", "provided", "own", "user_provided"}:
+        source = "user_provided"
+    else:
+        return {"success": False, "error": "Choose generate or provide; password preparation cancelled."}
 
     if source == "generated":
         alphabet = string.ascii_letters + string.digits
         password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
     elif source == "user_provided":
-        if not sys.stdin.isatty():
-            return {"success": False, "error": "User-provided password requires an interactive TTY; cancelled."}
         try:
             password = getpass.getpass("Enter password (input hidden): ")
             confirmation = getpass.getpass("Confirm password (input hidden): ")
