@@ -76,10 +76,9 @@ Your responsibilities:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
     - Before handling a credential, ask whether the user wants a generated password or wants to provide one.
-    - Ask the user to choose generated or user_provided before calling prepare_password.
-    - Pass that exact choice as source; use the returned placeholder in Secret.stringData.
-    - After user_provided is selected, call prepare_password immediately. Never ask the user to type a password in normal chat; prepare_password uses hidden input.
-    - If the latest user message says the password is already prepared and includes a placeholder, use that placeholder directly; do not call prepare_password again.
+    - Ask the user whether they prefer a generated or user-provided password.
+    - The application handles the choice and password locally, then supplies an opaque placeholder. Never call a password tool or ask the user to type a password in normal chat.
+    - When given a prepared-password placeholder, continue the pending task immediately and use it in Secret.stringData; do not ask for the source or password again.
     - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
@@ -205,21 +204,6 @@ TOOLS = [
                     "namespace": {"type": "string"}
                 },
                 "required": ["api_version", "kind", "name", "namespace"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "prepare_password",
-            "description": "Prepare a password only after the user chooses its source: generated or user_provided. Returns an opaque placeholder for Secret.stringData; never returns the password.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "enum": ["generated", "user_provided"]},
-                    "length": {"type": "integer", "default": 32}
-                },
-                "required": ["source"]
             }
         }
     },
@@ -650,7 +634,6 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         "k8s_events": k8s_events,
         "k8s_logs": k8s_logs,
         "k8s_delete": k8s_delete,
-        "prepare_password": prepare_password,
         "git_commit_and_push": git_commit_and_push,
     }
     fn = mapping.get(name)
@@ -820,10 +803,21 @@ if __name__ == "__main__":
             else:
                 result = {"success": False, "cancelled": True}
             if result.get("success"):
+                original_task = next(
+                    (
+                        message.get("content", "")
+                        for message in conversation or []
+                        if isinstance(message, dict) and message.get("role") == "user"
+                    ),
+                    ""
+                )
                 prompt = (
-                    f"The user selected {password_source} and the password has been prepared securely. "
-                    f"Use this placeholder as the Secret stringData value: "
-                    f"{result['secret_string_data_placeholder']}. Do not request or reveal the password."
+                    "The user is answering your password-source question for the pending task below. "
+                    f"Original task: {original_task}\n"
+                    f"The user selected {password_source}. The password is already prepared locally; "
+                    f"use this placeholder as the Secret stringData value: "
+                    f"{result['secret_string_data_placeholder']}. Continue the original task now. "
+                    "Do not ask for the password or its source again, and do not call any password tool."
                 )
             else:
                 prompt = f"Password preparation was not completed: {result.get('error', 'user declined')}"
