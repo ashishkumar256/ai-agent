@@ -88,6 +88,8 @@ Your responsibilities:
 
 Available tools are provided. Use them step by step.
 Never invent resource names or namespaces that the user did not request.
+When required names are unknown, ask for the namespace, then use k8s_get with name omitted or empty to list existing resources and let the user choose. Never end the interactive session merely because you need clarification; ask a concise follow-up question and wait for the user's next message.
+For password rotation, discover the existing Secret and workload before proposing changes. Do not assume changing a Kubernetes Secret alone changes the password inside a running database; explain and confirm the database password update and any required rollout.
 """
 
 # -------------------------------------------------
@@ -138,15 +140,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "k8s_get",
-            "description": "Get details of a Kubernetes resource",
+            "description": "Get a named Kubernetes resource or list resources of a kind in a namespace when name is omitted",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string"},
-                    "name": {"type": "string"},
+                    "name": {"type": "string", "description": "Optional; omit or use an empty string to list resources"},
                     "namespace": {"type": "string"}
                 },
-                "required": ["kind", "name", "namespace"]
+                "required": ["kind", "namespace"]
             }
         }
     },
@@ -374,9 +376,52 @@ def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 
         time.sleep(min(5, remaining))
 
 
-def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
+def k8s_get(kind: str, namespace: str, name: Optional[str] = None) -> Dict[str, Any]:
     try:
         kind_lower = kind.lower()
+        if not name:
+            list_methods = {
+                "statefulset": apps_v1.list_namespaced_stateful_set,
+                "sts": apps_v1.list_namespaced_stateful_set,
+                "deployment": apps_v1.list_namespaced_deployment,
+                "deploy": apps_v1.list_namespaced_deployment,
+                "pod": core_v1.list_namespaced_pod,
+                "secret": core_v1.list_namespaced_secret,
+                "service": core_v1.list_namespaced_service,
+                "svc": core_v1.list_namespaced_service,
+                "configmap": core_v1.list_namespaced_config_map,
+                "persistentvolumeclaim": core_v1.list_namespaced_persistent_volume_claim,
+                "pvc": core_v1.list_namespaced_persistent_volume_claim,
+            }
+            list_method = list_methods.get(kind_lower)
+            if list_method is None:
+                return {"success": False, "error": f"Listing is not supported for kind: {kind}"}
+
+            response = list_method(namespace, limit=100)
+            resources = []
+            for obj in response.items:
+                item = {
+                    "kind": kind,
+                    "name": obj.metadata.name,
+                    "namespace": obj.metadata.namespace,
+                    "labels": obj.metadata.labels or {},
+                }
+                if kind_lower == "secret":
+                    item["type"] = obj.type
+                    item["keys"] = sorted((obj.data or {}).keys())
+                    item["data"] = "redacted"
+                elif kind_lower in {"statefulset", "sts", "deployment", "deploy"}:
+                    item["replicas"] = obj.spec.replicas
+                    item["ready_replicas"] = obj.status.ready_replicas or 0
+                elif kind_lower == "pod":
+                    item["phase"] = obj.status.phase
+                    item["ready"] = all(status.ready for status in (obj.status.container_statuses or []))
+                elif kind_lower in {"persistentvolumeclaim", "pvc"}:
+                    item["phase"] = obj.status.phase
+                    item["storage"] = (obj.status.capacity or {}).get("storage")
+                resources.append(item)
+            return {"success": True, "kind": kind, "namespace": namespace, "count": len(resources), "resources": resources}
+
         if kind_lower in ["statefulset", "sts"]:
             obj = apps_v1.read_namespaced_stateful_set(name, namespace)
         elif kind_lower in ["deployment", "deploy"]:
@@ -393,7 +438,12 @@ def k8s_get(kind: str, name: str, namespace: str) -> Dict[str, Any]:
             resource = dyn_client.resources.get(kind=kind)
             obj = resource.get(name=name, namespace=namespace)
             return {"success": True, "object": obj.to_dict()}
-        return {"success": True, "object": api_client.sanitize_for_serialization(obj)}
+        serialized = api_client.sanitize_for_serialization(obj)
+        if kind_lower == "secret" and isinstance(serialized, dict):
+            serialized.pop("data", None)
+            serialized.pop("stringData", None)
+            serialized["redactedSecretKeys"] = sorted((obj.data or {}).keys())
+        return {"success": True, "object": serialized}
     except ApiException as e:
         return {"success": False, "error": str(e)}
 
@@ -612,11 +662,14 @@ def confirm_tool_call(name: str, args: Dict[str, Any]) -> bool:
 # -------------------------------------------------
 # Agent Loop
 # -------------------------------------------------
-def run_agent(user_prompt: str) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt}
-    ]
+def run_agent(user_prompt: str, messages: Optional[list] = None) -> str:
+    if messages is None:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+    else:
+        messages.append({"role": "user", "content": user_prompt})
     print(f"\n[Agent] Received prompt ({len(user_prompt)} chars). Starting...\n")
 
     for _ in range(25):
@@ -700,11 +753,7 @@ def run_agent(user_prompt: str) -> str:
 # Interactive input (for kubectl attach)
 # -------------------------------------------------
 def read_prompt_until_end() -> str:
-    print("=" * 60)
-    print("K8s AI Agent ready.")
-    print("Paste / type your prompt below.")
-    print("When finished, type   /end   on a new line and press Enter.")
-    print("=" * 60)
+    print("Task> (type /end on a new line to send, /exit to quit)")
     sys.stdout.flush()
 
     lines = []
@@ -712,7 +761,9 @@ def read_prompt_until_end() -> str:
         try:
             line = input()
         except EOFError:
-            break
+            return "\n".join(lines).strip() if lines else "/exit"
+        if line.strip() in {"/exit", "/quit"}:
+            return "/exit"
         if line.strip() == "/end":
             break
         lines.append(line)
@@ -723,20 +774,28 @@ def read_prompt_until_end() -> str:
 # Entry point
 # -------------------------------------------------
 if __name__ == "__main__":
-    if not sys.stdin.isatty() and len(sys.argv) == 1:
-        # Running under kubectl attach / pipe
-        prompt = read_prompt_until_end()
-    elif len(sys.argv) > 1:
-        prompt = " ".join(sys.argv[1:])
+    conversation = None
+    if len(sys.argv) > 1:
+        prompts = [" ".join(sys.argv[1:])]
     else:
-        prompt = read_prompt_until_end()
+        prompts = None
 
-    if not prompt:
-        print("No prompt received. Exiting.")
-        sys.exit(1)
+    while True:
+        prompt = prompts.pop(0) if prompts else read_prompt_until_end()
+        if prompt == "/exit":
+            break
+        if not prompt:
+            if prompts is None and not sys.stdin.isatty():
+                break
+            continue
 
-    final = run_agent(prompt)
-    print("\n" + "=" * 60)
-    print("FINAL ANSWER")
-    print("=" * 60)
-    print(final)
+        if conversation is None:
+            conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+        final = run_agent(prompt, conversation)
+        print("\n" + "=" * 60)
+        print("AGENT RESPONSE")
+        print("=" * 60)
+        print(final)
+
+        if prompts is not None:
+            break

@@ -119,7 +119,7 @@ You are asked, in order:
 4. **Task**: type or paste it (include the namespace), then put `/end` on its own line
 5. **Approvals** as the agent works (see [Safety model](#safety-model))
 
-After the first report you can keep giving instructions in the same session. Type `exit` to quit.
+After each response, keep chatting in the same session; type `/end` on its own line to submit the current message. Use `/exit` or `/quit` to end the session. If the agent needs a namespace or resource name, answer its follow-up instead of restarting; it can list existing names with `k8s_get` when you do not know them.
 `/model <name>` switches model without losing the session; follow it with `continue`.
 
 ## Example task: highly available PostgreSQL 16
