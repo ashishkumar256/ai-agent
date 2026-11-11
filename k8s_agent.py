@@ -784,10 +784,26 @@ def run_agent(user_prompt: str, messages: Optional[list] = None) -> str:
 # -------------------------------------------------
 # Interactive input (for kubectl attach)
 # -------------------------------------------------
-def read_prompt_until_end() -> str:
+def read_prompt_until_end(previous_response: Optional[str] = None) -> str:
+    last_line = previous_response.rstrip().splitlines()[-1] if previous_response and previous_response.strip() else ""
+    is_confirmation = "?" in last_line and bool(
+        re.search(r"\byes\s*/\s*no\b|\byes\s+or\s+no\b|\[y\s*/\s*n\]", last_line, re.IGNORECASE)
+    )
+    if is_confirmation:
+        print(previous_response)
+        while True:
+            try:
+                answer = input("Confirm? [y/N]: ").strip().lower()
+            except EOFError:
+                return "/exit"
+            if answer in {"y", "yes"}:
+                return "yes"
+            if answer in {"n", "no", ""}:
+                return "no"
+            print("Please answer y or n.")
+
     print("Task> (type /end on a new line to send, /exit to quit)")
     sys.stdout.flush()
-
     lines = []
     while True:
         try:
@@ -807,13 +823,14 @@ def read_prompt_until_end() -> str:
 # -------------------------------------------------
 if __name__ == "__main__":
     conversation = None
+    previous_response = None
     if len(sys.argv) > 1:
         prompts = [" ".join(sys.argv[1:])]
     else:
         prompts = None
 
     while True:
-        prompt = prompts.pop(0) if prompts else read_prompt_until_end()
+        prompt = prompts.pop(0) if prompts else read_prompt_until_end(previous_response)
         if prompt == "/exit":
             break
         if not prompt:
@@ -856,6 +873,8 @@ if __name__ == "__main__":
                 print("AGENT RESPONSE")
                 print("=" * 60)
                 print(final)
+
+            previous_response = final
 
         if prompts is not None:
             break
