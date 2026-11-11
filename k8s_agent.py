@@ -660,6 +660,7 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def confirm_tool_call(name: str, args: Dict[str, Any]) -> bool:
+    resource_details = ""
     if name == "k8s_apply":
         resource = args.get("resource")
         resource_details = f" for {resource}" if resource else ""
