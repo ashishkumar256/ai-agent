@@ -13,6 +13,7 @@ import re
 import time
 import tempfile
 import shutil
+import getpass
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -57,6 +58,8 @@ storage_v1 = client.StorageV1Api()
 dyn_client = dynamic.DynamicClient(api_client)
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+PASSWORD_VALUES: Dict[str, str] = {}
+PASSWORD_PLACEHOLDER_PREFIX = "__K8S_AGENT_PASSWORD_"
 
 # -------------------------------------------------
 # System Prompt
@@ -72,6 +75,8 @@ Your responsibilities:
 3. Decide intelligently whether a Secret is needed:
    - Databases (Postgres, MySQL, MongoDB, Redis with auth) → YES
    - Kafka, Zookeeper, Nginx, most stateless apps → usually NO
+    - For credentials, call generate_password and use the returned placeholder as the value in Secret.stringData.
+    - Never ask the model to create, reveal, or repeat the actual password; passwords are inserted locally.
 4. Always wait until resources become Ready.
     - k8s_wait_ready waits no longer than 60 seconds and may return earlier when ready.
     - If readiness times out, inspect k8s_events for the affected resource first.
@@ -199,7 +204,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_password",
-            "description": "Generate a secure random password",
+            "description": "Prompt the user to use a generated or hidden user-provided password; return an opaque placeholder for Secret.stringData, never the password itself",
             "parameters": {
                 "type": "object",
                 "properties": {"length": {"type": "integer", "default": 32}},
@@ -260,11 +265,22 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
     try:
         docs = list(yaml.safe_load_all(yaml_content))
         results = []
+        used_password_placeholders = set()
         for doc in docs:
             if not doc or not isinstance(doc, dict):
                 continue
             if namespace:
                 doc.setdefault("metadata", {})["namespace"] = namespace
+
+            if doc.get("kind", "").lower() == "secret":
+                string_data = doc.get("stringData")
+                if isinstance(string_data, dict):
+                    for key, value in string_data.items():
+                        if isinstance(value, str):
+                            for placeholder, password in PASSWORD_VALUES.items():
+                                if placeholder in value:
+                                    string_data[key] = value.replace(placeholder, password)
+                                    used_password_placeholders.add(placeholder)
 
             api_version = doc.get("apiVersion", "v1")
             kind = doc.get("kind")
@@ -297,6 +313,8 @@ def k8s_apply(yaml_content: str, namespace: Optional[str] = None) -> Dict[str, A
                     raise
 
             results.append({"action": action, "kind": kind, "name": name, "namespace": ns if resource.namespaced else None})
+        for placeholder in used_password_placeholders:
+            PASSWORD_VALUES.pop(placeholder, None)
         return {"success": True, "results": results}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -463,9 +481,42 @@ def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[s
 
 
 def generate_password(length: int = 32) -> Dict[str, Any]:
-    import secrets, string
-    alphabet = string.ascii_letters + string.digits
-    return {"password": ''.join(secrets.choice(alphabet) for _ in range(length))}
+    import secrets
+    import string
+
+    if not sys.stdin.isatty():
+        return {"success": False, "error": "Password selection requires an interactive TTY; password creation cancelled."}
+
+    try:
+        choice = input("Use a generated password? [Y/n]: ").strip().lower()
+    except EOFError:
+        return {"success": False, "error": "No interactive input; password creation cancelled."}
+    if choice not in {"", "y", "yes", "n", "no"}:
+        return {"success": False, "error": "Choose yes or no; password creation cancelled."}
+
+    if choice in {"n", "no"}:
+        try:
+            password = getpass.getpass("Enter password (input hidden): ")
+            confirmation = getpass.getpass("Confirm password: ")
+        except EOFError:
+            return {"success": False, "error": "No interactive input; password creation cancelled."}
+        if not password:
+            return {"success": False, "error": "Password cannot be empty."}
+        if password != confirmation:
+            return {"success": False, "error": "Passwords did not match; retry password creation."}
+    else:
+        alphabet = string.ascii_letters + string.digits
+        password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+
+    placeholder = f"{PASSWORD_PLACEHOLDER_PREFIX}{secrets.token_hex(8)}__"
+    PASSWORD_VALUES[placeholder] = password
+    return {
+        "success": True,
+        "password_ready": True,
+        "source": "user-provided" if choice in {"n", "no"} else "generated",
+        "secret_string_data_placeholder": placeholder,
+        "note": "Use this placeholder as the Secret stringData value; the actual password is inserted locally and is not returned."
+    }
 
 
 def git_commit_and_push(repo_url: str, branch: str, files: Dict[str, str], commit_message: str) -> Dict[str, Any]:
