@@ -361,18 +361,39 @@ def k8s_wait_ready(kind: str, name: str, namespace: str, timeout_seconds: int = 
                 ready = obj.status.ready_replicas or 0
                 desired = obj.spec.replicas or 0
                 if ready == desired:
-                    return {"ready": True, "ready_replicas": ready, "desired": desired}
+                    return {
+                        "ready": True,
+                        "kind": kind,
+                        "name": name,
+                        "namespace": namespace,
+                        "ready_replicas": ready,
+                        "desired": desired
+                    }
             elif kind_lower in ["deployment", "deploy"]:
                 obj = apps_v1.read_namespaced_deployment(name, namespace, _request_timeout=remaining)
                 ready = obj.status.ready_replicas or 0
                 desired = obj.spec.replicas or 0
                 if ready == desired:
-                    return {"ready": True, "ready_replicas": ready, "desired": desired}
+                    return {
+                        "ready": True,
+                        "kind": kind,
+                        "name": name,
+                        "namespace": namespace,
+                        "ready_replicas": ready,
+                        "desired": desired
+                    }
             elif kind_lower == "pod":
                 obj = core_v1.read_namespaced_pod(name, namespace, _request_timeout=remaining)
                 statuses = obj.status.container_statuses or []
                 if obj.status.phase == "Running" and statuses and all(container.ready for container in statuses):
-                    return {"ready": True, "phase": "Running", "containers_ready": len(statuses)}
+                    return {
+                        "ready": True,
+                        "kind": kind,
+                        "name": name,
+                        "namespace": namespace,
+                        "phase": "Running",
+                        "containers_ready": len(statuses)
+                    }
             else:
                 return {"error": f"Unsupported kind for wait: {kind}"}
         except ApiException as e:
