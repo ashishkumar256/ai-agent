@@ -2,3 +2,4 @@ groq
 kubernetes>=29
 pyyaml
 dulwich
+pwinput

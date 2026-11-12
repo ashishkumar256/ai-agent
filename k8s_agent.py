@@ -550,11 +550,16 @@ def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[s
 
 
 def prepare_password(length: int = 32) -> Dict[str, Any]:
-    import secrets
-    import string
+    import string, secrets, pwinput
 
+    choice = input("Choose password type:\n1. User-provided password\n2. Auto-generated password\nEnter choice: ")
     alphabet = string.ascii_letters + string.digits
-    password = "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+
+    password = (
+        pwinput.pwinput("Enter your password: ", mask="*")
+        if choice == "1"
+        else "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+    )
 
     placeholder = f"{PASSWORD_PLACEHOLDER_PREFIX}{secrets.token_hex(8)}__"
     PASSWORD_VALUES[placeholder] = password
