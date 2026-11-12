@@ -221,3 +221,4 @@ __marimo__/
 
 # Local Kubernetes API credentials; never commit this file
 /agent-secrets.yaml
+.env.git
