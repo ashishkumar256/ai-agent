@@ -211,9 +211,7 @@ TOOLS = [
             "description": "Generate a strong random password locally. Never return the password; returns only an opaque Secret stringData placeholder.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "length": {"type": "integer", "default": 32}
-                },
+                "properties": {},
                 "required": []
             }
         }
@@ -549,7 +547,7 @@ def k8s_delete(api_version: str, kind: str, name: str, namespace: str) -> Dict[s
         return {"success": False, "error": f"Resource not found: {api_version}/{kind}"}
 
 
-def prepare_password(length: int = 32) -> Dict[str, Any]:
+def prepare_password() -> Dict[str, Any]:
     import string, secrets, pwinput
 
     choice = input("Choose password type:\n1. User-provided password\n2. Auto-generated password\nEnter choice: ")
@@ -558,7 +556,7 @@ def prepare_password(length: int = 32) -> Dict[str, Any]:
     password = (
         pwinput.pwinput("Enter your password: ", mask="*")
         if choice == "1"
-        else "".join(secrets.choice(alphabet) for _ in range(max(1, length)))
+        else "".join(secrets.choice(alphabet) for _ in range(32))
     )
 
     placeholder = f"{PASSWORD_PLACEHOLDER_PREFIX}{secrets.token_hex(8)}__"
