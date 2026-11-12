@@ -652,11 +652,12 @@ def confirm_tool_call(name: str, args: Dict[str, Any]) -> bool:
         if args.get("namespace"):
             print(f"Namespace: {args['namespace']}")
     else:
-        print("\nOperation details:")
-        print(json.dumps(args, indent=2))
+        if args:
+            print("\nOperation details:")
+            print(json.dumps(args, indent=2))
 
     try:
-        answer = input(f"Approve tool action '{name}'{resource_details}? [y/N]: ").strip().lower()
+        answer = input(f"Approve tool action '{name}'{resource_details}? [y/n]: ").strip().lower()
     except EOFError:
         print("No interactive input; operation denied.")
         return False
@@ -767,7 +768,7 @@ def read_prompt_until_end(previous_response: Optional[str] = None) -> str:
         print(previous_response)
         while True:
             try:
-                answer = input("Confirm? [y/N]: ").strip().lower()
+                answer = input("Confirm? [y/n]: ").strip().lower()
             except EOFError:
                 return "/exit"
             if answer in {"y", "yes"}:
