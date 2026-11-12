@@ -739,7 +739,7 @@ def run_agent(user_prompt: str, messages: Optional[list] = None) -> str:
             except json.JSONDecodeError:
                 fn_args = {}
             print(f"\n[Tool] {fn_name}")
-            if fn_name == "k8s_apply":
+            if fn_name in {"k8s_apply", "k8s_wait_ready", "k8s_events", "k8s_logs"}:
                 result = execute_tool(fn_name, fn_args)
             elif confirm_tool_call(fn_name, fn_args):
                 result = execute_tool(fn_name, fn_args)
