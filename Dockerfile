@@ -1,4 +1,18 @@
+FROM ashishkumar256/gitinfo:1 AS gitinfo
+COPY .git .git
+RUN create-git-env.sh
+
 FROM python:3.12-slim
+
+COPY --from=gitinfo /src/.env .env.git
+
+# Optional: turn the values into Docker labels
+RUN export $(cat .env | xargs)
+LABEL git.commit_id="${COMMIT_ID}" \
+      git.commit_msg="${COMMIT_MSG}" \
+      git.commit_email="${COMMIT_EMAIL}" \
+      git.commit_name="${COMMIT_NAME}" \
+      git.commit_url="${COMMIT_URL}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
