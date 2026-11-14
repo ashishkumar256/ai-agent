@@ -1,13 +1,19 @@
+# Extract git commit info
 FROM ashishkumar256/gitinfo:1 AS gitinfo
+
 COPY .git .git
+
 RUN create-git-env.sh
 
+
+# Final app image
 FROM python:3.12-slim
 
 COPY --from=gitinfo /src/.env .env.git
 
 # Optional: turn the values into Docker labels
-RUN export $(cat .env | xargs)
+RUN export $(grep -v '^#' .env)
+
 LABEL git.commit_id="${COMMIT_ID}" \
       git.commit_msg="${COMMIT_MSG}" \
       git.commit_email="${COMMIT_EMAIL}" \
